@@ -718,11 +718,37 @@ async function getMediaResources(type, tmdbId) {
   }
   const page = await ensurePage();
   const mediaPath = `/tmdb/${type}/${encodeURIComponent(tmdbId)}`;
+  const capturedTargets = [];
+  const observedCustomerRequests = [];
   const capturedResponses = [];
+  const onRequest = (request) => {
+    try {
+      const url = new URL(request.url());
+      if (!url.pathname.startsWith('/api/customer/')) {
+        return;
+      }
+      const query = Object.fromEntries(url.searchParams.entries());
+      observedCustomerRequests.push({
+        pathname: url.pathname,
+        method: request.method(),
+        query,
+        postData: parseMaybeJson(request.postData())
+      });
+      if (url.pathname === '/api/customer/subscriptions/check') {
+        const targetType = query.target_type || '';
+        const targetKey = query.target_key || '';
+        if (targetType && targetKey) {
+          capturedTargets.push({ target_type: targetType, target_key: targetKey });
+        }
+      }
+    } catch {
+      // Ignore observer errors; resource scraping below still runs.
+    }
+  };
   const onResponse = async (response) => {
     try {
       const url = new URL(response.url());
-      if (url.pathname !== '/api/customer/resources') {
+      if (!url.pathname.startsWith('/api/customer/')) {
         return;
       }
       const request = response.request();
@@ -748,69 +774,169 @@ async function getMediaResources(type, tmdbId) {
       // Ignore observer errors; manual fallback below still runs.
     }
   };
+  page.on('request', onRequest);
   page.on('response', onResponse);
-  const waitForResourcesResponse = page.waitForResponse((response) => {
-    try {
-      return new URL(response.url()).pathname === '/api/customer/resources';
-    } catch {
-      return false;
+  try {
+    await page.goto(toAbsoluteUrl(mediaPath), {
+      waitUntil: 'domcontentloaded',
+      timeout: config.navigationTimeoutMs
+    });
+    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+    await dismissKnownNotice(page);
+    await scrollPage(page, 6, 900, 400);
+
+    const pageText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
+    if (/出现了很奇怪的错误/.test(pageText)) {
+      return {
+        success: false,
+        error: '影巢详情页拒绝当前浏览器环境，请重启 Bridge 或尝试关闭 Headless',
+        data: await safePageSummary(page, Date.now())
+      };
     }
-  }, { timeout: 15_000 }).catch(() => null);
-  await page.goto(toAbsoluteUrl(mediaPath), {
-    waitUntil: 'domcontentloaded',
-    timeout: config.navigationTimeoutMs
-  });
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-  await waitForResourcesResponse;
-  page.off('response', onResponse);
-  const html = await page.content();
-  const target = extractMediaResourceTarget(html, type, tmdbId);
-  const capturedSuccess = capturedResponses.find((item) => {
-    const payload = item.body?.response ?? item.body?.data ?? item.body;
-    return item.ok && !item.body?.error && item.body?.success !== false && payload;
-  });
-  if (capturedSuccess) {
+    if (/\/login(?:\?|$)/i.test(page.url())) {
+      return {
+        success: false,
+        error: '影巢登录态已失效，请重新登录或同步 Cookie',
+        data: await safePageSummary(page, Date.now())
+      };
+    }
+
+    const clickedCloud189Tab = await clickCloud189Tab(page);
+    if (clickedCloud189Tab) {
+      await page.waitForTimeout(1500);
+      await scrollPage(page, 4, 700, 250);
+    }
+
+    const html = await page.content();
+    const target = extractMediaResourceTarget(html, type, tmdbId, capturedTargets);
+    const domResources = await scrapeCloud189Resources(page);
+    const htmlResources = extractResourceEntriesFromHtml(html, page.url());
+    const resources = mergeResources([...domResources, ...htmlResources]);
+    const payload = {
+      success: true,
+      data: resources,
+      message: resources.length ? 'success' : '未找到天翼云盘资源',
+      code: '200'
+    };
     return {
       success: true,
       data: {
         mediaPath,
+        pageUrl: page.url(),
         target,
-        request: capturedSuccess.request,
-        payload: capturedSuccess.body,
-        captured: true
+        payload,
+        resources,
+        captured: true,
+        source: 'page-rendered-resources',
+        clickedCloud189Tab,
+        observedCustomerRequests: observedCustomerRequests.slice(-20),
+        capturedResponses: capturedResponses.slice(-20)
       }
     };
+  } finally {
+    page.off('request', onRequest);
+    page.off('response', onResponse);
   }
-  const attempts = [
-    { method: 'POST', body: target },
-    { method: 'GET', query: target },
-    { method: 'POST', body: { type, tmdb_id: tmdbId, tmdbId, target_key: `${type}:${tmdbId}` } },
-    { method: 'GET', query: { type, tmdb_id: tmdbId, tmdbId, target_key: `${type}:${tmdbId}` } }
-  ].filter((item) => item.body || item.query);
+}
 
-  const errors = [];
-  for (const attempt of attempts) {
-    const result = await customerRequest('/api/customer/resources', attempt);
-    if (result.success) {
-      return {
-        success: true,
-        data: {
-          mediaPath,
-          target,
-          request: attempt,
-          payload: result.data.payload,
-          elapsedMs: result.data.elapsedMs
-        }
+async function dismissKnownNotice(page) {
+  await page.getByText(/我知道了/).click({ timeout: 2000 }).catch(() => undefined);
+}
+
+async function scrollPage(page, times, deltaY, waitMs) {
+  for (let index = 0; index < times; index += 1) {
+    await page.mouse.wheel(0, deltaY);
+    await page.waitForTimeout(waitMs);
+  }
+}
+
+async function clickCloud189Tab(page) {
+  for (let index = 0; index < 12; index += 1) {
+    const clicked = await page.evaluate(() => {
+      const isVisible = (node) => {
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
+      const textOf = (node) => (node.innerText || node.textContent || '').trim();
+      const candidates = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],a'));
+      const exact = candidates.find((node) => isVisible(node) && /天翼云盘/.test(textOf(node)));
+      const fallback = candidates.find((node) => isVisible(node) && (/\b189\b/.test(textOf(node)) || /天翼/.test(textOf(node))));
+      const target = exact || fallback;
+      if (!target) {
+        return false;
+      }
+      target.scrollIntoView({ block: 'center', inline: 'center' });
+      target.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) {
+      return true;
     }
-    errors.push(result.error);
+    await page.mouse.wheel(0, 700);
+    await page.waitForTimeout(350);
   }
+  return false;
+}
 
-  return {
-    success: false,
-    error: errors.filter(Boolean).join('；') || '未能通过 customer resources 查询资源',
-    data: { mediaPath, target, capturedResponses }
-  };
+async function scrapeCloud189Resources(page) {
+  return await page.evaluate(() => {
+    const parseSize = (value) => {
+      const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)/i);
+      if (!match) {
+        return 0;
+      }
+      const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+      return Math.round(Number(match[1]) * units[match[2].toUpperCase()]);
+    };
+    const parseTitle = (lines) => {
+      const pointsIndex = lines.findIndex((line) => /免费|\d+\s*积分/.test(line));
+      const startIndex = pointsIndex >= 0 ? pointsIndex + 1 : 0;
+      const skipPattern = /^(发布于|免费|\d+\s*积分|疑似失效|加入片单|4K|1080P|720P|简中|简英双语|内封|外挂|WEB-DL\/WEBRip|蓝光原盘\/REMUX|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B))$/i;
+      const title = lines.slice(startIndex).find((line) => line.length > 3 && !skipPattern.test(line));
+      return title || lines[0] || '影巢天翼资源';
+    };
+    const parseResource = (anchor) => {
+      const href = new URL(anchor.href, location.href);
+      const parts = href.pathname.split('/').filter(Boolean);
+      const slug = decodeURIComponent(parts[2] || '');
+      if (!slug) {
+        return null;
+      }
+      let card = anchor;
+      for (let index = 0; index < 7 && card?.parentElement; index += 1) {
+        const parentText = (card.parentElement.innerText || '').trim();
+        if (/发布于|积分|免费|疑似失效|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B)/i.test(parentText)) {
+          card = card.parentElement;
+        } else if (index > 1) {
+          break;
+        } else {
+          card = card.parentElement;
+        }
+      }
+      const text = (card?.innerText || anchor.innerText || anchor.textContent || '').trim();
+      const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+      const pointsMatch = text.match(/(\d+)\s*积分/);
+      const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
+      return {
+        id: slug,
+        slug,
+        title: parseTitle(lines),
+        pan_type: '189',
+        share_size: parseSize(text),
+        unlock_points: pointsMatch ? Number(pointsMatch[1]) : 0,
+        expired: /疑似失效/.test(text),
+        is_unlocked: /已解锁|查看链接|复制链接/.test(text) || Boolean(cloudLink),
+        media_url: cloudLink?.[0] || '',
+        pageUrl: href.href,
+        user: lines[0] ? { name: lines[0] } : {},
+        publishedAt: (text.match(/发布于\s*([0-9/-]+)/) || [])[1] || '',
+        source: 'dom'
+      };
+    };
+    const anchors = Array.from(document.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'));
+    return anchors.map(parseResource).filter(Boolean);
+  }).catch(() => []);
 }
 
 async function safePageSummary(page, startedAt) {
@@ -961,6 +1087,95 @@ function parseMaybeJson(value) {
   }
 }
 
+function mergeResources(resources) {
+  const seen = new Set();
+  return resources.filter((resource) => {
+    const key = resource?.slug || resource?.id || resource?.pageUrl || resource?.media_url;
+    if (!key || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function extractResourceEntriesFromHtml(html, pageUrl = config.baseUrl) {
+  const text = decodeFlightText(html);
+  const resources = [];
+  const seen = new Set();
+  const pathRegex = /\/resource\/(?:189|cloud189|8)\/([A-Za-z0-9._~-]+)/g;
+  let pathMatch;
+  while ((pathMatch = pathRegex.exec(text)) !== null) {
+    const start = Math.max(0, pathMatch.index - 1500);
+    const end = Math.min(text.length, pathMatch.index + 3500);
+    addResourceEntry(resources, seen, decodeURIComponent(pathMatch[1]), text.slice(start, end), pageUrl);
+  }
+
+  const slugRegex = /"slug"\s*:\s*"([^"]+)"/g;
+  let slugMatch;
+  while ((slugMatch = slugRegex.exec(text)) !== null) {
+    const start = Math.max(0, slugMatch.index - 2000);
+    const end = Math.min(text.length, slugMatch.index + 4500);
+    const block = text.slice(start, end);
+    if (!/(?:"(?:website|website_id|netdisk_website_id|net_disk_website_id|pan_type|cloudType)"\s*:\s*"?189"?|天翼|cloud189|\/resource\/189\/)/i.test(block)) {
+      continue;
+    }
+    addResourceEntry(resources, seen, decodeJsonString(slugMatch[1]), block, pageUrl);
+  }
+  return resources;
+}
+
+function addResourceEntry(resources, seen, slug, block, pageUrl) {
+  const normalizedSlug = String(slug || '').trim();
+  if (!normalizedSlug || seen.has(normalizedSlug)) {
+    return;
+  }
+  seen.add(normalizedSlug);
+  const linkMatch = block.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
+  resources.push({
+    id: normalizedSlug,
+    slug: normalizedSlug,
+    title: extractResourceTitle(block, `影巢天翼资源 ${resources.length + 1}`),
+    pan_type: '189',
+    share_size: getNumberField(block, 'share_size') || getNumberField(block, 'size') || getNumberField(block, 'file_size'),
+    unlock_points: getNumberField(block, 'unlock_points') || getNumberField(block, 'points') || getNumberField(block, 'cost'),
+    expired: /"expired"\s*:\s*true|"isExpired"\s*:\s*true|疑似失效/i.test(block),
+    is_unlocked: /"is_unlocked"\s*:\s*true|"isUnlocked"\s*:\s*true|已解锁|查看链接|复制链接/i.test(block),
+    media_url: linkMatch?.[0] || '',
+    pageUrl: `${config.baseUrl}/resource/189/${encodeURIComponent(normalizedSlug)}`,
+    sourcePageUrl: pageUrl,
+    source: 'html'
+  });
+}
+
+function extractResourceTitle(block, fallback) {
+  return getStringField(block, 'title')
+    || getStringField(block, 'name')
+    || getStringField(block, 'resource_name')
+    || getStringField(block, 'media_name')
+    || fallback;
+}
+
+function getStringField(block, field) {
+  const escapedField = escapeRegExp(field);
+  const match = block.match(new RegExp(`"${escapedField}"\\s*:\\s*"([^"]*)"`, 'i'));
+  return match?.[1] ? decodeJsonString(match[1]) : '';
+}
+
+function getNumberField(block, field) {
+  const escapedField = escapeRegExp(field);
+  const match = block.match(new RegExp(`"${escapedField}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`, 'i'));
+  return match ? Number(match[1]) : 0;
+}
+
+function decodeJsonString(value) {
+  try {
+    return JSON.parse(`"${String(value || '').replace(/"/g, '\\"')}"`);
+  } catch {
+    return value;
+  }
+}
+
 function normalizeResourceId(value) {
   const resourceId = String(value || '').trim();
   if (!/^[A-Za-z0-9._~-]+$/.test(resourceId)) {
@@ -969,7 +1184,15 @@ function normalizeResourceId(value) {
   return resourceId;
 }
 
-function extractMediaResourceTarget(html, type, tmdbId) {
+function extractMediaResourceTarget(html, type, tmdbId, observedTargets = []) {
+  const observedTarget = observedTargets.find((target) => (
+    target?.target_type === 'media_resource'
+    && typeof target?.target_key === 'string'
+    && target.target_key.startsWith(`${type}:`)
+  ));
+  if (observedTarget) {
+    return observedTarget;
+  }
   const text = decodeFlightText(html);
   const escapedType = escapeRegExp(type);
   const escapedTmdbId = escapeRegExp(String(tmdbId));
@@ -989,6 +1212,22 @@ function extractMediaResourceTarget(html, type, tmdbId) {
       target_type: 'media_resource',
       target_id: Number(reverseMatch[1]),
       target_key: reverseMatch[2]
+    };
+  }
+  const genericTargetPattern = new RegExp(`"target_key"\\s*:\\s*"(${escapedType}:\\d+)"[\\s\\S]{0,800}?"target_type"\\s*:\\s*"media_resource"`, 'i');
+  const genericTargetMatch = text.match(genericTargetPattern);
+  if (genericTargetMatch) {
+    return {
+      target_type: 'media_resource',
+      target_key: genericTargetMatch[1]
+    };
+  }
+  const genericReversePattern = new RegExp(`"target_type"\\s*:\\s*"media_resource"[\\s\\S]{0,800}?"target_key"\\s*:\\s*"(${escapedType}:\\d+)"`, 'i');
+  const genericReverseMatch = text.match(genericReversePattern);
+  if (genericReverseMatch) {
+    return {
+      target_type: 'media_resource',
+      target_key: genericReverseMatch[1]
     };
   }
   return {
