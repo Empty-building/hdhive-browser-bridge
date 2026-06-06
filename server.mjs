@@ -295,6 +295,63 @@ async function installStealthInitScript(context) {
     Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'], configurable: true });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5], configurable: true });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+    if (navigator.userAgentData) {
+      Object.defineProperty(navigator, 'userAgentData', {
+        get: () => ({
+          brands: [
+            { brand: 'Google Chrome', version: '125' },
+            { brand: 'Chromium', version: '125' },
+            { brand: 'Not.A/Brand', version: '24' }
+          ],
+          mobile: false,
+          platform: 'Windows',
+          getHighEntropyValues: async () => ({
+            brands: [
+              { brand: 'Google Chrome', version: '125' },
+              { brand: 'Chromium', version: '125' },
+              { brand: 'Not.A/Brand', version: '24' }
+            ],
+            fullVersionList: [
+              { brand: 'Google Chrome', version: '125.0.0.0' },
+              { brand: 'Chromium', version: '125.0.0.0' },
+              { brand: 'Not.A/Brand', version: '24.0.0.0' }
+            ],
+            mobile: false,
+            platform: 'Windows',
+            platformVersion: '15.0.0',
+            architecture: 'x86',
+            bitness: '64',
+            model: '',
+            uaFullVersion: '125.0.0.0',
+            wow64: false
+          })
+        }),
+        configurable: true
+      });
+    }
+    const patchWebGL = (prototype) => {
+      if (!prototype?.getParameter) {
+        return;
+      }
+      const originalGetParameter = prototype.getParameter;
+      Object.defineProperty(prototype, 'getParameter', {
+        value(parameter) {
+          if (parameter === 37445) {
+            return 'Google Inc. (Intel)';
+          }
+          if (parameter === 37446) {
+            return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+          }
+          return originalGetParameter.call(this, parameter);
+        },
+        configurable: true
+      });
+    };
+    patchWebGL(window.WebGLRenderingContext?.prototype);
+    patchWebGL(window.WebGL2RenderingContext?.prototype);
     window.chrome = window.chrome || { runtime: {} };
     for (const key of ['__playwright__binding__', '__pwInitScripts']) {
       try {
