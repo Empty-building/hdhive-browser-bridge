@@ -718,13 +718,69 @@ async function getMediaResources(type, tmdbId) {
   }
   const page = await ensurePage();
   const mediaPath = `/tmdb/${type}/${encodeURIComponent(tmdbId)}`;
+  const capturedResponses = [];
+  const onResponse = async (response) => {
+    try {
+      const url = new URL(response.url());
+      if (url.pathname !== '/api/customer/resources') {
+        return;
+      }
+      const request = response.request();
+      const contentType = response.headers()['content-type'] || '';
+      let body = null;
+      if (contentType.includes('application/json')) {
+        body = await response.json().catch(() => null);
+      } else {
+        body = await response.text().catch(() => '');
+      }
+      capturedResponses.push({
+        url: response.url(),
+        status: response.status(),
+        ok: response.ok(),
+        request: {
+          method: request.method(),
+          postData: parseMaybeJson(request.postData()),
+          headers: pickHeaders(request.headers(), ['content-type'])
+        },
+        body
+      });
+    } catch {
+      // Ignore observer errors; manual fallback below still runs.
+    }
+  };
+  page.on('response', onResponse);
+  const waitForResourcesResponse = page.waitForResponse((response) => {
+    try {
+      return new URL(response.url()).pathname === '/api/customer/resources';
+    } catch {
+      return false;
+    }
+  }, { timeout: 15_000 }).catch(() => null);
   await page.goto(toAbsoluteUrl(mediaPath), {
     waitUntil: 'domcontentloaded',
     timeout: config.navigationTimeoutMs
   });
   await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+  await waitForResourcesResponse;
+  page.off('response', onResponse);
   const html = await page.content();
   const target = extractMediaResourceTarget(html, type, tmdbId);
+  const capturedSuccess = capturedResponses.find((item) => {
+    const payload = item.body?.response ?? item.body?.data ?? item.body;
+    return item.ok && !item.body?.error && item.body?.success !== false && payload;
+  });
+  if (capturedSuccess) {
+    return {
+      success: true,
+      data: {
+        mediaPath,
+        target,
+        request: capturedSuccess.request,
+        payload: capturedSuccess.body,
+        captured: true
+      }
+    };
+  }
   const attempts = [
     { method: 'POST', body: target },
     { method: 'GET', query: target },
@@ -753,7 +809,7 @@ async function getMediaResources(type, tmdbId) {
   return {
     success: false,
     error: errors.filter(Boolean).join('；') || '未能通过 customer resources 查询资源',
-    data: { mediaPath, target }
+    data: { mediaPath, target, capturedResponses }
   };
 }
 
@@ -882,6 +938,27 @@ function pickPrimitiveQuery(value) {
     }
   }
   return query;
+}
+
+function pickHeaders(headers, names) {
+  const result = {};
+  for (const name of names) {
+    if (headers[name]) {
+      result[name] = headers[name];
+    }
+  }
+  return result;
+}
+
+function parseMaybeJson(value) {
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
 }
 
 function normalizeResourceId(value) {
