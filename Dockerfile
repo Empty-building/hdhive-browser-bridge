@@ -6,10 +6,10 @@ ENV NODE_ENV=production
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-COPY browser-bridge/package.json browser-bridge/package-lock.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-COPY browser-bridge/server.mjs ./
+COPY server.mjs ./
 
 EXPOSE 10000
 
