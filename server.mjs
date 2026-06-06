@@ -717,7 +717,7 @@ async function getMediaResources(type, tmdbId) {
     return { success: false, error: 'type 必须是 movie/tv，tmdbId 不能为空' };
   }
   const page = await ensurePage();
-  const mediaPath = `/${type}/${encodeURIComponent(tmdbId)}`;
+  const mediaPath = `/tmdb/${type}/${encodeURIComponent(tmdbId)}`;
   await page.goto(toAbsoluteUrl(mediaPath), {
     waitUntil: 'domcontentloaded',
     timeout: config.navigationTimeoutMs
