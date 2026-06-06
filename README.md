@@ -34,9 +34,13 @@ npm start
 - `BRIDGE_TOKEN`：建议必填，保护公开接口。
 - `HDHIVE_BASE_URL`：默认 `https://hdhive.com`。
 - `HDHIVE_COOKIE`：可选，浏览器启动时注入影巢 Cookie。
-- `HDHIVE_USERNAME`：可选，`POST /hdhive/login` 未传账号时使用。
-- `HDHIVE_PASSWORD`：可选，`POST /hdhive/login` 未传密码时使用。
-- `BROWSER_PROFILE_DIR`：默认 `/data/hdhive-profile`，配 Render Disk 时可持久化登录态。
+- `HDHIVE_USERNAME`：可选，不推荐在 Bridge 侧配置；优先在主项目设置页配置账号。
+- `HDHIVE_PASSWORD`：可选，不推荐在 Bridge 侧配置；优先在主项目设置页配置密码。
+- `DATABASE_URL` / `BRIDGE_STATE_DATABASE_URL`：可选，Postgres 连接串；配置后会把浏览器 Cookie/StorageState 加密持久化到云数据库，容器重启后自动恢复登录态。
+- `BRIDGE_STATE_SECRET`：可选，云端状态加密密钥；不填时使用 `BRIDGE_TOKEN` 派生密钥。
+- `BRIDGE_STATE_KEY`：可选，同一个数据库里区分不同 Bridge 实例，默认 `hdhive-default`。
+- `BRIDGE_STATE_DATABASE_SSL`：可选，设为 `false` 可关闭 Postgres SSL；云数据库默认自动启用 SSL。
+- `BROWSER_PROFILE_DIR`：默认 `/data/hdhive-profile`；有云数据库后不再必须配置 Render Disk。
 - `BROWSER_HEADLESS`：默认 `true`；如登录页拒绝 Headless，可设为 `false` 做排查。
 - `LOGIN_TIMEOUT_MS`：默认 `45000`。
 - `CUSTOMER_API_TIMEOUT_MS`：默认 `30000`。
@@ -47,3 +51,10 @@ npm start
 ## 说明
 
 这个容器只开放固定白名单动作，不开放任意 JS 执行接口，避免公开部署后变成远程执行入口。`/api/customer/*` 调用通过影巢页面运行时已加载的签名 API 客户端完成，不在 Node 后端重实现 WASM 签名。
+
+推荐部署方式：
+
+1. Render 给 Bridge 配置 `BRIDGE_TOKEN` 和 Postgres `DATABASE_URL`，不要配置影巢账号密码。
+2. 主项目设置页配置 Browser Bridge 地址、Token、影巢网页登录账号和密码。
+3. 在主项目“影巢”页点击网页登录取 Cookie。Bridge 登录成功后会把登录态写入云数据库。
+4. 后续 Render 容器冷启动或重启时，Bridge 会从云数据库恢复 Cookie/StorageState。

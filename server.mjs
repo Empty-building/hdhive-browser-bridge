@@ -1,6 +1,6 @@
 import express from 'express';
 import { chromium } from 'playwright';
-import { randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 
 const config = {
@@ -19,7 +19,11 @@ const config = {
   customerApiTimeoutMs: Number(process.env.CUSTOMER_API_TIMEOUT_MS || 30_000),
   idlePageUrl: process.env.IDLE_PAGE_URL || '/',
   warmupUrls: parseWarmupUrls(process.env.WARMUP_URLS || '/,/search'),
-  maxHtmlChars: Number(process.env.MAX_HTML_CHARS || 0)
+  maxHtmlChars: Number(process.env.MAX_HTML_CHARS || 0),
+  stateDatabaseUrl: String(process.env.BRIDGE_STATE_DATABASE_URL || process.env.DATABASE_URL || ''),
+  stateDatabaseSsl: String(process.env.BRIDGE_STATE_DATABASE_SSL || ''),
+  stateKey: String(process.env.BRIDGE_STATE_KEY || 'hdhive-default'),
+  stateSecret: String(process.env.BRIDGE_STATE_SECRET || process.env.BRIDGE_TOKEN || '')
 };
 
 const state = {
@@ -35,7 +39,14 @@ const state = {
   warmupCount: 0,
   restartCount: 0,
   activeAction: null,
-  actionQueue: Promise.resolve()
+  actionQueue: Promise.resolve(),
+  stateDbPool: null,
+  stateDbInitialized: false,
+  stateLoadedAt: 0,
+  statePersistedAt: 0,
+  stateLoadOk: false,
+  statePersistOk: false,
+  stateLastError: ''
 };
 
 const app = express();
@@ -271,6 +282,7 @@ async function ensurePage() {
     state.browserLaunchMs = Date.now() - startedAt;
     state.restartCount += 1;
     await installStealthInitScript(state.context);
+    await restoreBrowserState(state.context);
     await seedCookies(state.context);
   }
 
@@ -454,6 +466,7 @@ async function openPage(urlOrPath, includeHtml = false) {
 async function getCookieSnapshot() {
   const page = await ensurePage();
   const cookies = await page.context().cookies(config.baseUrl);
+  await persistBrowserState(page.context(), 'cookies');
   return {
     success: true,
     data: {
@@ -516,11 +529,13 @@ async function loginWithPassword(username, password) {
   if (!loginResult.success) {
     return loginResult;
   }
+  const statePersisted = await persistBrowserState(page.context(), 'login');
 
   return {
     success: true,
     data: {
       ...loginResult.data,
+      statePersisted,
       elapsedMs: Date.now() - startedAt
     }
   };
@@ -654,12 +669,14 @@ async function customerRequest(pathname, options = {}) {
     }
   }, payload);
 
+  const statePersisted = result.ok ? await persistBrowserState(page.context(), `customer:${pathname}`) : false;
   return {
     success: Boolean(result.ok),
     data: {
       path: pathname,
       method: payload.method,
       payload: result.payload,
+      statePersisted,
       elapsedMs: Date.now() - startedAt
     },
     ...(result.ok ? {} : { error: result.payload?.message || result.payload?.description || '影巢 customer API 调用失败' })
@@ -812,6 +829,7 @@ async function getMediaResources(type, tmdbId) {
     const domResources = await scrapeCloud189Resources(page);
     const htmlResources = extractResourceEntriesFromHtml(html, page.url());
     const resources = mergeResources([...domResources, ...htmlResources]);
+    const statePersisted = await persistBrowserState(page.context(), 'media-resources');
     const payload = {
       success: true,
       data: resources,
@@ -828,6 +846,7 @@ async function getMediaResources(type, tmdbId) {
         resources,
         captured: true,
         source: 'page-rendered-resources',
+        statePersisted,
         clickedCloud189Tab,
         observedCustomerRequests: observedCustomerRequests.slice(-20),
         capturedResponses: capturedResponses.slice(-20)
@@ -939,6 +958,188 @@ async function scrapeCloud189Resources(page) {
   }).catch(() => []);
 }
 
+async function getStateDbPool() {
+  if (!config.stateDatabaseUrl) {
+    return null;
+  }
+  if (state.stateDbPool) {
+    return state.stateDbPool;
+  }
+  const { Pool } = await import('pg');
+  state.stateDbPool = new Pool({
+    connectionString: config.stateDatabaseUrl,
+    ssl: resolveStateDatabaseSsl(config.stateDatabaseUrl, config.stateDatabaseSsl),
+    max: 2,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000
+  });
+  return state.stateDbPool;
+}
+
+async function ensureStateTable() {
+  const pool = await getStateDbPool();
+  if (!pool || state.stateDbInitialized) {
+    return pool;
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS browser_bridge_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  state.stateDbInitialized = true;
+  return pool;
+}
+
+async function restoreBrowserState(context) {
+  if (!config.stateDatabaseUrl) {
+    return false;
+  }
+  try {
+    const pool = await ensureStateTable();
+    const result = await pool.query('SELECT value, updated_at FROM browser_bridge_state WHERE key = $1', [config.stateKey]);
+    const rawValue = result.rows[0]?.value;
+    if (!rawValue) {
+      state.stateLoadOk = true;
+      state.stateLoadedAt = Date.now();
+      state.stateLastError = '';
+      return false;
+    }
+    const snapshot = decodeStateValue(rawValue);
+    const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
+    if (cookies.length > 0) {
+      await context.addCookies(cookies);
+    }
+    const origins = Array.isArray(snapshot?.origins) ? snapshot.origins : [];
+    if (origins.length > 0) {
+      await context.addInitScript((storedOrigins) => {
+        const matched = storedOrigins.find((origin) => origin.origin === window.location.origin);
+        if (!matched?.localStorage) {
+          return;
+        }
+        for (const item of matched.localStorage) {
+          try {
+            window.localStorage.setItem(item.name, item.value);
+          } catch {
+            // ignore
+          }
+        }
+      }, origins);
+    }
+    state.stateLoadOk = true;
+    state.stateLoadedAt = Date.now();
+    state.stateLastError = '';
+    return true;
+  } catch (error) {
+    state.stateLoadOk = false;
+    state.stateLastError = `restore: ${error instanceof Error ? error.message : String(error)}`;
+    console.warn('[browser-bridge] restore state skipped:', state.stateLastError);
+    return false;
+  }
+}
+
+async function persistBrowserState(context, reason = 'manual') {
+  if (!config.stateDatabaseUrl || !context) {
+    return false;
+  }
+  try {
+    const pool = await ensureStateTable();
+    const snapshot = await context.storageState();
+    const encoded = encodeStateValue({
+      ...snapshot,
+      meta: {
+        reason,
+        baseUrl: config.baseUrl,
+        savedAt: new Date().toISOString(),
+        hostname: os.hostname()
+      }
+    });
+    await pool.query(`
+      INSERT INTO browser_bridge_state (key, value, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (key)
+      DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+    `, [config.stateKey, encoded]);
+    state.statePersistOk = true;
+    state.statePersistedAt = Date.now();
+    state.stateLastError = '';
+    return true;
+  } catch (error) {
+    state.statePersistOk = false;
+    state.stateLastError = `persist: ${error instanceof Error ? error.message : String(error)}`;
+    console.warn('[browser-bridge] persist state failed:', state.stateLastError);
+    return false;
+  }
+}
+
+async function closeStateDatabase() {
+  if (!state.stateDbPool) {
+    return;
+  }
+  await state.stateDbPool.end().catch(() => undefined);
+  state.stateDbPool = null;
+  state.stateDbInitialized = false;
+}
+
+function resolveStateDatabaseSsl(databaseUrl, sslMode) {
+  const normalizedMode = String(sslMode || '').trim().toLowerCase();
+  if (['false', '0', 'off', 'disable'].includes(normalizedMode)) {
+    return false;
+  }
+  if (['true', '1', 'on', 'require'].includes(normalizedMode)) {
+    return { rejectUnauthorized: false };
+  }
+  try {
+    const url = new URL(databaseUrl);
+    if (['localhost', '127.0.0.1', '::1'].includes(url.hostname)) {
+      return false;
+    }
+  } catch {
+    return { rejectUnauthorized: false };
+  }
+  return { rejectUnauthorized: false };
+}
+
+function encodeStateValue(value) {
+  const json = JSON.stringify(value);
+  if (!config.stateSecret) {
+    return JSON.stringify({ version: 1, encoding: 'plain-json', data: json });
+  }
+  const iv = randomBytes(12);
+  const key = createHash('sha256').update(config.stateSecret).digest();
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(json, 'utf8'), cipher.final()]);
+  return JSON.stringify({
+    version: 1,
+    encoding: 'aes-256-gcm',
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    data: encrypted.toString('base64')
+  });
+}
+
+function decodeStateValue(value) {
+  const parsed = JSON.parse(String(value || '{}'));
+  if (parsed.encoding === 'plain-json') {
+    return JSON.parse(parsed.data || '{}');
+  }
+  if (parsed.encoding !== 'aes-256-gcm') {
+    return parsed;
+  }
+  if (!config.stateSecret) {
+    throw new Error('BRIDGE_STATE_SECRET/BRIDGE_TOKEN 未配置，无法解密云端浏览器状态');
+  }
+  const key = createHash('sha256').update(config.stateSecret).digest();
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(parsed.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(parsed.data, 'base64')),
+    decipher.final()
+  ]);
+  return JSON.parse(decrypted.toString('utf8'));
+}
+
 async function safePageSummary(page, startedAt) {
   return {
     url: page.url(),
@@ -950,6 +1151,7 @@ async function safePageSummary(page, startedAt) {
 
 async function closeBrowser() {
   if (state.context) {
+    await persistBrowserState(state.context, 'close').catch(() => false);
     await state.context.close().catch(() => undefined);
   }
   state.context = null;
@@ -959,6 +1161,7 @@ async function closeBrowser() {
 async function shutdown() {
   console.log('[browser-bridge] shutting down');
   await closeBrowser();
+  await closeStateDatabase();
   process.exit(0);
 }
 
@@ -980,6 +1183,16 @@ function buildStatus() {
     hasCookie: Boolean(config.cookie),
     hasUsername: Boolean(config.username),
     protectedEndpoints: Boolean(config.bridgeToken),
+    cloudState: {
+      enabled: Boolean(config.stateDatabaseUrl),
+      key: config.stateDatabaseUrl ? config.stateKey : '',
+      encrypted: Boolean(config.stateDatabaseUrl && config.stateSecret),
+      loadedAt: state.stateLoadedAt ? new Date(state.stateLoadedAt).toISOString() : null,
+      persistedAt: state.statePersistedAt ? new Date(state.statePersistedAt).toISOString() : null,
+      loadOk: state.stateLoadOk,
+      persistOk: state.statePersistOk,
+      lastError: state.stateLastError
+    },
     hostname: os.hostname(),
     memory: {
       rss: memory.rss,
