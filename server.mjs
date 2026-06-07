@@ -72,12 +72,12 @@ app.get('/health', async (req, res) => {
   const ready = Boolean(state.context && state.page);
   res.status(ready ? 200 : 503).json({
     success: ready,
-    data: buildStatus()
+    data: await buildStatus()
   });
 });
 
 app.get('/metrics', async (req, res) => {
-  res.json({ success: true, data: buildStatus() });
+  res.json({ success: true, data: await buildStatus() });
 });
 
 app.post('/warmup', async (req, res) => {
@@ -209,7 +209,7 @@ app.post('/browser/restart', async (req, res) => {
   const result = await enqueueAction('browser-restart', async () => {
     await closeBrowser('restart');
     await ensurePage();
-    return { success: true, data: buildStatus() };
+    return { success: true, data: await buildStatus() };
   });
   res.status(result.success ? 200 : 500).json(result);
 });
@@ -225,6 +225,11 @@ app.listen(config.port, '0.0.0.0', async () => {
   }
 
   await enqueueAction('startup-warmup', () => warmup(config.warmupUrls));
+  if (config.username && config.password) {
+    await enqueueAction('startup-login', () => ensureLoggedIn(state.page)).catch((error) => {
+      console.error('[browser-bridge] startup login failed', error);
+    });
+  }
   setInterval(() => {
     enqueueAction('interval-keepalive', () => keepAlive()).catch((error) => {
       console.error('[browser-bridge] keepalive failed', error);
@@ -250,7 +255,7 @@ async function enqueueAction(name, action) {
       return {
         success: false,
         error: error instanceof Error ? error.message : String(error),
-        data: buildStatus()
+        data: await buildStatus()
       };
     } finally {
       state.activeAction = null;
@@ -450,23 +455,66 @@ async function warmup(urls) {
     success: !failed,
     data: {
       results,
-      status: buildStatus()
+      status: await buildStatus()
     },
     ...(failed ? { error: failed.error || 'warmup failed' } : {})
   };
 }
 
+let loggingIn = null;
+
+async function ensureLoggedIn(page) {
+  if (!config.username || !config.password) {
+    return false;
+  }
+  const targetPage = page && !page.isClosed() ? page : await ensurePage();
+  const cookies = await readContextCookies(targetPage.context()).catch(() => []);
+  const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid'];
+  if (cookies.some((cookie) => loginCookieNames.includes(cookie.name))) {
+    return true;
+  }
+  if (loggingIn) {
+    return loggingIn;
+  }
+  console.log('[browser-bridge] 登录态缺失，自动使用环境变量账号重新登录');
+  loggingIn = loginWithPassword(config.username, config.password)
+    .then((result) => {
+      if (!result.success) {
+        console.warn('[browser-bridge] 自动登录失败:', result.error || '未知错误');
+      }
+      return Boolean(result.success);
+    })
+    .catch((error) => {
+      console.warn('[browser-bridge] 自动登录异常:', error instanceof Error ? error.message : String(error));
+      return false;
+    })
+    .finally(() => {
+      loggingIn = null;
+    });
+  return loggingIn;
+}
+
 async function keepAlive() {
-  const page = await ensurePage();
+  let page = await ensurePage();
   if (page.isClosed()) {
     state.page = null;
-    await ensurePage();
+    page = await ensurePage();
   }
-  await page.evaluate(() => Date.now()).catch(async () => {
-    await closeBrowser();
-    await ensurePage();
-  });
-  return { success: true, data: buildStatus() };
+  const alive = await page.evaluate(() => Date.now()).then(() => true).catch(() => false);
+  if (!alive) {
+    // 软恢复：先尝试重新导航到空闲页，避免轻易销毁重建上下文（会丢失登录态）
+    const recovered = await page
+      .goto(toAbsoluteUrl(config.idlePageUrl), { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs })
+      .then(() => true)
+      .catch(() => false);
+    if (!recovered) {
+      await closeBrowser();
+      page = await ensurePage();
+    }
+  }
+  // 续签登录态：仅在登录 cookie 缺失时才真正重登，正常只读 cookie，开销极小
+  await ensureLoggedIn(page).catch(() => false);
+  return { success: true, data: await buildStatus() };
 }
 
 async function openPage(urlOrPath, includeHtml = false) {
@@ -534,10 +582,16 @@ async function loginWithPassword(username, password) {
 
   const usernameInput = page.locator('input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"], input[type="text"]').first();
   const passwordInput = page.locator('input[type="password"], input[name="password"], input[autocomplete="current-password"]').first();
+  // 显式等待登录表单异步渲染出现，容忍 SPA 渲染时机（networkidle 后表单可能尚未挂载，避免误判“未找到表单”）
+  await usernameInput.waitFor({ state: 'visible', timeout: 15000 }).catch(() => undefined);
+  await passwordInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => undefined);
   if (await usernameInput.count() === 0 || await passwordInput.count() === 0) {
+    const blockedAgain = await page.locator('text=出现了很奇怪的错误').count().catch(() => 0);
     return {
       success: false,
-      error: '未找到影巢登录表单，可能需要验证码、二次验证或页面结构已变化',
+      error: blockedAgain > 0
+        ? '影巢登录页拒绝当前浏览器环境，请尝试关闭 Headless 或调整浏览器指纹参数'
+        : '未找到影巢登录表单，可能需要验证码、二次验证或页面结构已变化',
       data: await safePageSummary(page, startedAt)
     };
   }
@@ -1695,8 +1749,9 @@ async function shutdown() {
   process.exit(0);
 }
 
-function buildStatus() {
+async function buildStatus() {
   const memory = process.memoryUsage();
+  const cookieStatus = await buildCookieStatus();
   return {
     uptimeSec: Math.round((Date.now() - state.startedAt) / 1000),
     browserReady: Boolean(state.context && state.page && !state.page.isClosed()),
@@ -1710,7 +1765,11 @@ function buildStatus() {
     restartCount: state.restartCount,
     activeAction: state.activeAction,
     baseUrl: config.baseUrl,
-    hasCookie: Boolean(config.cookie),
+    hasCookie: cookieStatus.hasCookie,
+    hasConfiguredCookie: cookieStatus.hasConfiguredCookie,
+    hasRuntimeCookie: cookieStatus.hasRuntimeCookie,
+    hasLoginCookie: cookieStatus.hasLoginCookie,
+    runtimeCookieCount: cookieStatus.runtimeCookieCount,
     hasUsername: Boolean(config.username),
     protectedEndpoints: Boolean(config.bridgeToken),
     cloudState: {
@@ -1729,6 +1788,26 @@ function buildStatus() {
       heapUsed: memory.heapUsed,
       heapTotal: memory.heapTotal
     }
+  };
+}
+
+async function buildCookieStatus() {
+  const configuredCookies = parseCookieHeader(config.cookie, config.baseUrl);
+  let runtimeCookies = [];
+  if (state.context) {
+    runtimeCookies = await readContextCookies(state.context).catch(() => []);
+  }
+  const cookieNames = new Set([
+    ...configuredCookies.map((cookie) => cookie.name),
+    ...runtimeCookies.map((cookie) => cookie.name)
+  ]);
+  const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid'];
+  return {
+    hasCookie: configuredCookies.length > 0 || runtimeCookies.length > 0,
+    hasConfiguredCookie: configuredCookies.length > 0,
+    hasRuntimeCookie: runtimeCookies.length > 0,
+    hasLoginCookie: loginCookieNames.some((name) => cookieNames.has(name)),
+    runtimeCookieCount: runtimeCookies.length
   };
 }
 
