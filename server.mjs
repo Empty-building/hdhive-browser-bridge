@@ -146,18 +146,24 @@ app.post('/hdhive/login', requireSensitiveEndpoint, async (req, res) => {
 });
 
 app.get('/hdhive/customer/current', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-current', () => customerRequest('/api/customer/user/current'));
+  const result = await enqueueAction('hdhive-customer-current', () => customerRequest('/api/customer/user/current', {
+    allowUnsignedResponseFallback: true
+  }));
   res.status(result.success ? 200 : 500).json(result);
 });
 
 app.post('/hdhive/customer/checkin', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-checkin', () => customerRequest('/api/customer/user/checkin', { method: 'POST' }));
+  const result = await enqueueAction('hdhive-customer-checkin', () => customerRequest('/api/customer/user/checkin', {
+    method: 'POST',
+    allowUnsignedResponseFallback: true
+  }));
   res.status(result.success ? 200 : 500).json(result);
 });
 
 app.get('/hdhive/customer/points-logs', requireSensitiveEndpoint, async (req, res) => {
   const result = await enqueueAction('hdhive-customer-points-logs', () => customerRequest('/api/customer/points-logs', {
-    query: pickPrimitiveQuery(req.query)
+    query: pickPrimitiveQuery(req.query),
+    allowUnsignedResponseFallback: true
   }));
   res.status(result.success ? 200 : 500).json(result);
 });
@@ -572,7 +578,7 @@ async function waitForLoggedIn(page, startedAt) {
     const cookies = await page.context().cookies(config.baseUrl);
     const cookieHeader = cookiesToHeader(cookies);
     if (cookieHeader && cookies.some((cookie) => ['token', 'csrf_access_token', 'hdh_uid'].includes(cookie.name))) {
-      const current = await customerRequest('/api/customer/user/current').catch((error) => ({
+      const current = await customerRequest('/api/customer/user/current', { allowUnsignedResponseFallback: true }).catch((error) => ({
         success: false,
         error: error instanceof Error ? error.message : String(error)
       }));
@@ -603,6 +609,32 @@ async function waitForLoggedIn(page, startedAt) {
 async function customerRequest(pathname, options = {}) {
   const page = await ensureRuntimePage();
   const startedAt = Date.now();
+  const observedResponses = [];
+  const observedResponsePromises = [];
+  const targetPathname = normalizeUrlPathname(pathname);
+  const onResponse = (response) => {
+    let url;
+    try {
+      url = new URL(response.url());
+    } catch {
+      return;
+    }
+    if (url.origin !== config.baseUrl || url.pathname !== targetPathname) {
+      return;
+    }
+    const promise = (async () => {
+      const headers = response.headers();
+      const text = await response.text().catch(() => '');
+      observedResponses.push({
+        url: response.url(),
+        status: response.status(),
+        ok: response.ok(),
+        headers: pickHeaders(headers, ['content-type', 'x-hdh-rsig', 'x-hdh-rts']),
+        body: parseMaybeJson(text)
+      });
+    })();
+    observedResponsePromises.push(promise);
+  };
   const payload = {
     path: pathname,
     method: options.method || 'GET',
@@ -610,7 +642,10 @@ async function customerRequest(pathname, options = {}) {
     body: options.body === undefined ? null : options.body,
     timeoutMs: config.customerApiTimeoutMs
   };
-  const result = await page.evaluate(async (request) => {
+  page.on('response', onResponse);
+  let result;
+  try {
+    result = await page.evaluate(async (request) => {
     const getWebpackRequire = () => {
       let webpackRequire = null;
       const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
@@ -705,8 +740,32 @@ async function customerRequest(pathname, options = {}) {
         }
       }), timeoutMs);
     });
-    return await Promise.race([call, timeout]);
-  }, payload);
+      return await Promise.race([call, timeout]);
+    }, payload);
+    await Promise.race([
+      Promise.allSettled(observedResponsePromises),
+      delay(1000)
+    ]);
+  } finally {
+    page.off('response', onResponse);
+  }
+
+  const observedResponse = observedResponses[observedResponses.length - 1] || null;
+  const responseSignatureMissing = isMissingResponseSignaturePayload(result.payload);
+  const unsignedResponseFallback = Boolean(
+    options.allowUnsignedResponseFallback
+    && !result.ok
+    && responseSignatureMissing
+    && observedResponse?.ok
+    && observedResponse.body !== undefined
+  );
+  if (unsignedResponseFallback) {
+    result = {
+      ok: true,
+      payload: observedResponse.body ?? { success: true, message: '影巢请求已完成但响应体为空' },
+      warning: '影巢响应缺少 X-HDH-RSig，已使用 Bridge 捕获到的同源网络响应正文'
+    };
+  }
 
   const statePersisted = result.ok ? await persistBrowserState(page.context(), `customer:${pathname}`) : false;
   return {
@@ -716,8 +775,16 @@ async function customerRequest(pathname, options = {}) {
       method: payload.method,
       payload: result.payload,
       statePersisted,
+      responseSignatureMissing,
+      unsignedResponseFallback,
+      observedResponse: observedResponse ? {
+        status: observedResponse.status,
+        ok: observedResponse.ok,
+        hasResponseSignature: Boolean(observedResponse.headers?.['x-hdh-rsig'])
+      } : null,
       elapsedMs: Date.now() - startedAt
     },
+    ...(result.warning ? { warning: result.warning } : {}),
     ...(result.ok ? {} : { error: result.payload?.message || result.payload?.description || '影巢 customer API 调用失败' })
   };
 }
@@ -1245,6 +1312,25 @@ function normalizeStateDatabaseUrl(databaseUrl) {
   } catch {
     return databaseUrl;
   }
+}
+
+function normalizeUrlPathname(value) {
+  try {
+    return new URL(String(value || '/'), config.baseUrl).pathname;
+  } catch {
+    return String(value || '/').split('?')[0] || '/';
+  }
+}
+
+function isMissingResponseSignaturePayload(payload) {
+  const message = [
+    payload?.message,
+    payload?.description,
+    payload?.error,
+    payload?.name,
+    typeof payload === 'string' ? payload : ''
+  ].filter(Boolean).join(' ');
+  return /X-HDH-RSig|RSig|响应携带.*签名头|未收到.*签名头|Missing X-HDH-RSig/i.test(message);
 }
 
 function encodeStateValue(value) {
