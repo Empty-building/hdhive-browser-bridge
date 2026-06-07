@@ -42,6 +42,7 @@ npm start
 - `BRIDGE_STATE_DATABASE_SSL`：可选，设为 `false` 可关闭 Postgres SSL，设为 `verify-full` 可启用证书校验；云数据库默认自动启用 SSL。
 - `BROWSER_PROFILE_DIR`：默认 `/data/hdhive-profile`；有云数据库后不再必须配置 Render Disk。
 - `BROWSER_HEADLESS`：默认 `true`；如登录页拒绝 Headless，可设为 `false` 做排查。
+- `ACTION_TIMEOUT_MS`：默认 `120000`，单个 Bridge 动作最长执行时间；超时会重置浏览器上下文，避免队列卡死。
 - `LOGIN_TIMEOUT_MS`：默认 `45000`。
 - `CUSTOMER_API_TIMEOUT_MS`：默认 `30000`。
 - `WARMUP_URLS`：默认 `/,/search`。

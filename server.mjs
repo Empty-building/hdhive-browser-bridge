@@ -17,6 +17,7 @@ const config = {
   navigationTimeoutMs: Number(process.env.NAVIGATION_TIMEOUT_MS || 30_000),
   loginTimeoutMs: Number(process.env.LOGIN_TIMEOUT_MS || 45_000),
   customerApiTimeoutMs: Number(process.env.CUSTOMER_API_TIMEOUT_MS || 30_000),
+  actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 120_000),
   idlePageUrl: process.env.IDLE_PAGE_URL || '/',
   warmupUrls: parseWarmupUrls(process.env.WARMUP_URLS || '/,/search'),
   maxHtmlChars: Number(process.env.MAX_HTML_CHARS || 0),
@@ -238,8 +239,11 @@ async function enqueueAction(name, action) {
   const run = async () => {
     state.activeAction = { id, name, startedAt: Date.now() };
     try {
-      return await action();
+      return await runActionWithTimeout(name, action);
     } catch (error) {
+      if (error instanceof ActionTimeoutError) {
+        await closeBrowser(`timeout:${name}`, { persist: false });
+      }
       return {
         success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -253,6 +257,24 @@ async function enqueueAction(name, action) {
   const next = state.actionQueue.then(run, run);
   state.actionQueue = next.then(() => undefined, () => undefined);
   return next;
+}
+
+class ActionTimeoutError extends Error {
+  constructor(name, timeoutMs) {
+    super(`Bridge action ${name} timed out after ${timeoutMs}ms`);
+    this.name = 'ActionTimeoutError';
+  }
+}
+
+async function runActionWithTimeout(name, action) {
+  const actionPromise = Promise.resolve().then(action);
+  actionPromise.catch(() => undefined);
+  return await Promise.race([
+    actionPromise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new ActionTimeoutError(name, config.actionTimeoutMs)), config.actionTimeoutMs).unref();
+    })
+  ]);
 }
 
 async function ensurePage() {
@@ -585,7 +607,8 @@ async function customerRequest(pathname, options = {}) {
     path: pathname,
     method: options.method || 'GET',
     query: options.query || null,
-    body: options.body === undefined ? null : options.body
+    body: options.body === undefined ? null : options.body,
+    timeoutMs: config.customerApiTimeoutMs
   };
   const result = await page.evaluate(async (request) => {
     const getWebpackRequire = () => {
@@ -649,25 +672,40 @@ async function customerRequest(pathname, options = {}) {
     const query = request.query && typeof request.query === 'object' ? request.query : undefined;
     const method = String(request.method || 'GET').toUpperCase();
     const config = query ? { params: query } : undefined;
-    try {
-      const response = method === 'GET'
-        ? await client.get(request.path, config)
-        : await client.post(request.path, request.body ?? undefined, config);
-      if (response?.error) {
-        return { ok: false, payload: response.error };
+    const call = (async () => {
+      try {
+        const response = method === 'GET'
+          ? await client.get(request.path, config)
+          : await client.post(request.path, request.body ?? undefined, config);
+        if (response?.error) {
+          return { ok: false, payload: response.error };
+        }
+        return { ok: true, payload: response?.response ?? response };
+      } catch (error) {
+        return {
+          ok: false,
+          payload: {
+            name: error?.name || '',
+            code: error?.code || '',
+            httpStatus: error?.httpStatus || error?.status || 0,
+            message: error?.message || error?.description || String(error)
+          }
+        };
       }
-      return { ok: true, payload: response?.response ?? response };
-    } catch (error) {
-      return {
+    })();
+    const timeoutMs = Number(request.timeoutMs || 30_000);
+    const timeout = new Promise((resolve) => {
+      setTimeout(() => resolve({
         ok: false,
         payload: {
-          name: error?.name || '',
-          code: error?.code || '',
-          httpStatus: error?.httpStatus || error?.status || 0,
-          message: error?.message || error?.description || String(error)
+          name: 'TimeoutError',
+          code: 'customer_api_timeout',
+          httpStatus: 0,
+          message: `影巢 customer API 调用超时: ${timeoutMs}ms`
         }
-      };
-    }
+      }), timeoutMs);
+    });
+    return await Promise.race([call, timeout]);
   }, payload);
 
   const statePersisted = result.ok ? await persistBrowserState(page.context(), `customer:${pathname}`) : false;
@@ -1257,9 +1295,11 @@ async function safePageSummary(page, startedAt) {
   };
 }
 
-async function closeBrowser(reason = 'close') {
+async function closeBrowser(reason = 'close', options = {}) {
   if (state.context) {
-    await persistBrowserState(state.context, reason).catch(() => false);
+    if (options.persist !== false) {
+      await persistBrowserState(state.context, reason).catch(() => false);
+    }
     await state.context.close().catch(() => undefined);
   }
   state.context = null;
