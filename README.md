@@ -23,6 +23,7 @@ npm start
 - `POST /hdhive/customer/checkin`：签到。
 - `GET /hdhive/customer/points-logs`：积分日志。
 - `POST /hdhive/customer/media-resources`：按 `{ "type": "movie|tv", "tmdbId": "..." }` 查询资源。
+- `GET /hdhive/customer/resources/:resourceId`：只读解析资源详情和已解锁天翼链接。
 - `POST /hdhive/customer/resources/:resourceId/unlock`：解锁资源。
 - `POST /browser/restart`：重启浏览器上下文。
 
