@@ -1,3 +1,12 @@
+---
+title: HDHive Browser Bridge
+emoji: 🎬
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # HDHive Browser Bridge
 
 常驻 Chromium 的独立容器，用来降低影巢网页签名接口的冷启动成本，并通过白名单动作调用 `/api/customer/*`。
