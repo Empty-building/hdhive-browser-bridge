@@ -291,6 +291,63 @@ export class HdhiveClient {
   }
 
   /**
+   * 预览 TMDB 资源的积分情况（**不消耗积分！**）
+   * 推荐在 unlockByTmdbId 之前先调用，确认积分预算
+   * @param {number} tmdbId
+   * @param {string} type 'movie' | 'tv'
+   * @returns {Promise<{success, currentPoints, resources, totalCost, ...}>}
+   */
+  async previewTmdb(tmdbId, type = 'movie') {
+    // 1. 解析 TMDB → 内部 URL
+    const resolved = await this.resolveTmdbToInternal(tmdbId, type);
+
+    // 2. 找资源列表
+    const resources = await this.findResourcesFromMoviePage(resolved.url);
+
+    // 3. 对每个资源查询所需积分（checkResource 不消耗积分）
+    const enriched = [];
+    for (const r of resources) {
+      try {
+        const check = await this.checkResource(`${this.baseUrl}/resource/189/${r.slug}`);
+        enriched.push({
+          slug: r.slug,
+          url: r.url,
+          title: r.text.split('\n')[0]?.slice(0, 60),
+          unlock_points: check.data?.data?.default_unlock_points ?? null,
+          website: check.data?.data?.website
+        });
+      } catch (e) {
+        enriched.push({
+          slug: r.slug,
+          url: r.url,
+          title: r.text.split('\n')[0]?.slice(0, 60),
+          unlock_points: null,
+          error: e.message.slice(0, 100)
+        });
+      }
+    }
+
+    // 4. 当前用户积分
+    let currentPoints = null;
+    try {
+      const user = await this.getCurrentUser();
+      currentPoints = user.data?.data?.user_meta?.points;
+    } catch {}
+
+    return {
+      success: true,
+      tmdbId,
+      type,
+      movieSlug: resolved.slug,
+      movieUrl: resolved.url,
+      currentPoints,
+      resources: enriched,
+      totalCost: enriched.reduce((sum, r) => sum + (r.unlock_points || 0), 0),
+      cheapestCost: enriched.length > 0 ? Math.min(...enriched.map(r => r.unlock_points || 0)) : 0
+    };
+  }
+
+  /**
    * 通过 TMDB ID 解析影巢内部 URL（**无需登录**）
    * 拦截第一次重定向（/tmdb/movie/{id} → /movie/{内部slug}）就停止
    */

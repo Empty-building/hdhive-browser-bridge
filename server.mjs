@@ -282,11 +282,68 @@ app.get('/hdhive/public/bulletins/latest', async (req, res) => {
 // ─────────────────── ★ 一键解锁（核心接口）───────────────────
 
 // TMDB ID 一键解锁：解析 → 找资源 → 解锁 → 拿网盘
+// ⚠️ 此接口会消耗积分！未解锁的资源需要积分
 app.post('/hdhive/unlock/tmdb/:tmdbId', async (req, res) => {
   const r = await withTimeout('unlock/tmdb', async () => {
     const client = getClient(getRequestCookie(req));
     const type = req.body?.type || req.query.type || 'movie';
     return await client.unlockByTmdbId(Number(req.params.tmdbId), type);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// TMDB ID 只查询不解锁：列出资源 + 积分，但不扣积分
+// ✅ 推荐先调用这个，确认后再决定是否解锁
+app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
+  const r = await withTimeout('preview/tmdb', async () => {
+    const client = getClient(getRequestCookie(req));
+    const type = req.body?.type || req.query.type || 'movie';
+
+    // 解析 TMDB → 影巢内部 URL
+    const resolved = await client.resolveTmdbToInternal(Number(req.params.tmdbId), type);
+
+    // 找资源列表
+    const resources = await client.findResourcesFromMoviePage(resolved.url);
+
+    // 对每个资源查需要的积分（不消耗）
+    const enriched = [];
+    for (const r of resources) {
+      try {
+        const check = await client.checkResource(`${config.baseUrl}/resource/189/${r.slug}`);
+        enriched.push({
+          slug: r.slug,
+          url: r.url,
+          title: r.text.split('\n')[0]?.slice(0, 60),
+          unlock_points: check.data?.data?.default_unlock_points ?? null,
+          website: check.data?.data?.website
+        });
+      } catch (e) {
+        enriched.push({
+          slug: r.slug,
+          url: r.url,
+          title: r.text.split('\n')[0]?.slice(0, 60),
+          unlock_points: null,
+          error: e.message.slice(0, 100)
+        });
+      }
+    }
+
+    // 当前用户积分
+    let currentPoints = null;
+    try {
+      const user = await client.getCurrentUser();
+      currentPoints = user.data?.data?.user_meta?.points;
+    } catch {}
+
+    return {
+      tmdbId: Number(req.params.tmdbId),
+      type,
+      movieSlug: resolved.slug,
+      movieUrl: resolved.url,
+      currentPoints,
+      resources: enriched,
+      totalCost: enriched.reduce((sum, r) => sum + (r.unlock_points || 0), 0)
+    };
   });
   res.status(r.success ? 200 : 500).json(r);
 });

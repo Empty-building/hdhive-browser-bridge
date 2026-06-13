@@ -186,8 +186,37 @@ curl -X POST -H "x-bridge-token: xxx" \
 
 ### ⭐ TMDB 一键解锁（核心接口）
 
-#### `POST /hdhive/unlock/tmdb/:tmdbId`
-从 TMDB ID 一键解锁并拿网盘（**最常用**）。
+#### `POST /hdhive/preview/tmdb/:tmdbId` ⭐ 推荐先调用
+**只查询不解锁，列出所有资源 + 所需积分**（不消耗积分）。
+
+```bash
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:10000/hdhive/preview/tmdb/372058
+```
+
+**返回**：
+```json
+{
+  "success": true,
+  "data": {
+    "tmdbId": 372058,
+    "movieSlug": "0816e198eae211ed8d4e0242ac190003",
+    "currentPoints": 1052,
+    "resources": [
+      { "slug": "3fb1cb68...", "title": "任秋叶卷起", "unlock_points": 1, "website": "189" },
+      { "slug": "749f49bc...", "title": "风的语言", "unlock_points": 1, "website": "189" },
+      { "slug": "33642915...", "title": "任秋叶卷起 (免费)", "unlock_points": 0, "website": "189" }
+    ],
+    "totalCost": 2,
+    "cheapestCost": 0
+  }
+}
+```
+
+#### `POST /hdhive/unlock/tmdb/:tmdbId` ⚠️ 会消耗积分
+从 TMDB ID 一键解锁并拿网盘。
 
 ```bash
 curl -X POST -H "x-bridge-token: xxx" \
@@ -222,7 +251,7 @@ curl -X POST -H "x-bridge-token: xxx" \
 }
 ```
 
-#### `POST /hdhive/unlock/resource/:slug`
+#### `POST /hdhive/unlock/resource/:slug` ⚠️ 会消耗积分
 通过 resource slug 解锁。
 
 ```bash
@@ -230,7 +259,7 @@ curl -X POST -H "x-bridge-token: xxx" \
   http://localhost:10000/hdhive/unlock/resource/3fb1cb6823c64ae4a7a0f8f23bd4bed3
 ```
 
-#### `POST /hdhive/unlock/share`
+#### `POST /hdhive/unlock/share` ⚠️ 会消耗积分
 通过分享 URL 解锁。
 
 ```bash
@@ -241,12 +270,92 @@ curl -X POST -H "x-bridge-token: xxx" \
 ```
 
 #### `GET /hdhive/resource/:slug/cloud189`
-单独提取 189 网盘链接。
+单独提取 189 网盘链接（仅已解锁资源可用）。
 
 ```bash
 curl -H "x-bridge-token: xxx" \
   http://localhost:10000/hdhive/resource/3fb1cb6823c64ae4a7a0f8f23bd4bed3/cloud189
 ```
+
+---
+
+## ⚠️ 积分保护：确认调用流程
+
+**`/hdhive/unlock/*` 接口会消耗积分**。生产部署务必加预览+预算控制。
+
+### 积分规则
+
+| 资源状态 | 调用 unlock 接口后 |
+|---------|-------------------|
+| `unlock_points = 0`（免费） | ❌ 不扣 |
+| `unlock_points > 0` 已解锁 | ❌ 不重复扣（返回 `already_owned: true`）|
+| `unlock_points > 0` 未解锁 | ✅ **扣 unlock_points 积分** |
+
+### 推荐流程：先 preview 再 unlock
+
+```bash
+# 第 1 步：预览（不消耗积分）
+curl -X POST -H "x-bridge-token: xxx" -d '{}' \
+  http://localhost:10000/hdhive/preview/tmdb/372058
+
+# 检查返回的 totalCost 和 currentPoints，确认预算
+
+# 第 2 步：确认后一键解锁（消耗积分）
+curl -X POST -H "x-bridge-token: xxx" -d '{}' \
+  http://localhost:10000/hdhive/unlock/tmdb/372058
+```
+
+### 客户端代码示例（带积分预算）
+
+```js
+const POINTS_BUDGET = 50;
+let totalSpent = 0;
+
+for (const tmdbId of [372058, 550, 129]) {
+  // 1. 预览（不消耗积分）
+  const preview = await fetch(`http://hdhive-api:10000/hdhive/preview/tmdb/${tmdbId}`, {
+    method: 'POST',
+    headers: { 'x-bridge-token': 'xxx' }
+  }).then(r => r.json());
+
+  // 2. 预算检查
+  if (totalSpent + preview.data.cheapestCost > POINTS_BUDGET) {
+    console.log(`⊘ TMDB ${tmdbId}: 预算不足`);
+    continue;
+  }
+
+  // 3. 解锁
+  const result = await fetch(`http://hdhive-api:10000/hdhive/unlock/tmdb/${tmdbId}`, {
+    method: 'POST',
+    headers: { 'x-bridge-token': 'xxx' }
+  }).then(r => r.json());
+
+  totalSpent += preview.data.cheapestCost;
+  console.log(`✓ TMDB ${tmdbId}: ${result.data.cloud189.fullText}`);
+}
+```
+
+### 不消耗积分的接口（可安全调用）
+
+- `GET /health`
+- `GET /metrics`
+- `POST /warmup`
+- `GET /hdhive/customer/current`
+- `GET /hdhive/customer/points-logs`
+- `GET /hdhive/customer/messages/unread-count`
+- **`POST /hdhive/customer/checkin`（增加积分！）**
+- `GET /hdhive/customer/playlists/my`
+- `POST /hdhive/customer/subscriptions/check`
+- `POST /hdhive/customer/check/resource`
+- **`POST /hdhive/preview/tmdb/:id`** ⭐
+- `GET /hdhive/public/bulletins/latest`
+- `GET /hdhive/resource/:slug/cloud189`（仅已解锁）
+
+### 会消耗积分的接口（谨慎调用）
+
+- `POST /hdhive/unlock/tmdb/:id`
+- `POST /hdhive/unlock/resource/:slug`
+- `POST /hdhive/unlock/share`
 
 ---
 

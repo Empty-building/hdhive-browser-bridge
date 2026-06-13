@@ -336,9 +336,55 @@ console.log('网盘:', links.fullText);
 
 ---
 
-## 完整示例
+## ⚠️ 确认调用流程（积分保护）
 
-### 示例 1：批量解锁多个 TMDB 电影
+**`unlockByTmdbId` / `unlockByResourceSlug` / `unlockByShareUrl` / `/hdhive/unlock/*` 都会消耗积分！**
+
+### 积分规则
+
+| 资源状态 | 调用 unlock 接口后 |
+|---------|-------------------|
+| `unlock_points = 0`（免费） | ❌ 不扣 |
+| `unlock_points > 0`（付费）+ 已解锁 | ❌ 不重复扣（返回 `already_owned: true`）|
+| `unlock_points > 0`（付费）+ 未解锁 | ✅ **扣 unlock_points 积分** |
+
+### 推荐流程（先预览后解锁）
+
+```js
+// ✅ 第 1 步：预览（不消耗积分）
+const preview = await client.previewTmdb(372058, 'movie');
+console.log(`当前积分: ${preview.currentPoints}`);
+console.log(`该电影有 ${preview.resources.length} 个资源`);
+console.log(`总扣费: ${preview.totalCost} 积分`);
+for (const r of preview.resources) {
+  console.log(`  - ${r.title}: ${r.unlock_points} 积分`);
+}
+
+// 确认后再解锁
+if (preview.totalCost > 0 && preview.currentPoints >= preview.totalCost) {
+  // ✅ 第 2 步：确认后一键解锁（消耗积分）
+  const result = await client.unlockByTmdbId(372058, 'movie');
+  console.log(result.cloud189.fullText);
+}
+```
+
+### HTTP 等价接口
+
+```bash
+# 第 1 步：预览（不消耗积分）
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:10000/hdhive/preview/tmdb/372058
+
+# 第 2 步：确认后一键解锁（消耗积分）
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:10000/hdhive/unlock/tmdb/372058
+```
+
+### 批量解锁 + 积分预算
 
 ```js
 import { HdhiveClient } from './api-client.mjs';
@@ -347,17 +393,138 @@ import fs from 'node:fs';
 const cookie = fs.readFileSync('/tmp/hdhive-cookies.txt', 'utf8').trim();
 const client = new HdhiveClient({ baseUrl: 'https://hdhive.com', cookie });
 
-const tmdbIds = [372058, 550, 129, 13, 680]; // 你的名字、搏击俱乐部、千与千寻、Forrest Gump、辛德勒名单
+const tmdbIds = [372058, 550, 129, 13, 680];
+const MAX_POINTS_PER_MOVIE = 5;  // 每个电影最多花 5 积分
+const POINTS_BUDGET = 50;         // 总预算 50 积分
+
+let totalSpent = 0;
 
 for (const tmdbId of tmdbIds) {
+  // 第 1 步：预览
+  const preview = await client.previewTmdb(tmdbId, 'movie');
+  if (!preview.success) {
+    console.log(`⊘ TMDB ${tmdbId}: 预览失败`);
+    continue;
+  }
+
+  if (preview.resources.length === 0) {
+    console.log(`⊘ TMDB ${tmdbId}: 没有 189 资源`);
+    continue;
+  }
+
+  const cost = preview.totalCost;
+  const cheapest = Math.min(...preview.resources.map(r => r.unlock_points || 0));
+
+  // 预算检查
+  if (totalSpent + cheapest > POINTS_BUDGET) {
+    console.log(`⊘ TMDB ${tmdbId}: 预算不足（已花 ${totalSpent}/${POINTS_BUDGET}）`);
+    continue;
+  }
+
+  if (cheapest > MAX_POINTS_PER_MOVIE) {
+    console.log(`⊘ TMDB ${tmdbId}: 最便宜资源需 ${cheapest} 积分，超过单电影预算`);
+    continue;
+  }
+
+  // 第 2 步：解锁
   try {
     const result = await client.unlockByTmdbId(tmdbId, 'movie');
+    totalSpent += cost;
+    console.log(`✓ TMDB ${tmdbId}: ${result.cloud189.fullText} (累计 ${totalSpent} 积分)`);
+  } catch (e) {
+    console.log(`✗ TMDB ${tmdbId}: ${e.message.slice(0, 80)}`);
+  }
+}
+
+console.log(`\n总共花费 ${totalSpent} 积分`);
+await client.close();
+```
+
+### 不消耗积分的接口（安全）
+
+| 接口 | 说明 |
+|------|------|
+| `GET /hdhive/customer/current` | 当前用户 |
+| `GET /hdhive/customer/points-logs` | 积分日志 |
+| `GET /hdhive/customer/messages/unread-count` | 未读消息 |
+| `POST /hdhive/customer/checkin` | **签到（增加积分！）** |
+| `GET /hdhive/customer/playlists/my` | 我的播放列表 |
+| `POST /hdhive/customer/subscriptions/check` | 订阅检查 |
+| `GET /hdhive/customer/resources/:id` | 资源详情（限创建者）|
+| `POST /hdhive/customer/check/resource` | 检查分享链接 |
+| **`POST /hdhive/preview/tmdb/:id`** ⭐ | **预览资源（不消耗）** |
+| `GET /hdhive/public/bulletins/latest` | 最新公告 |
+| `GET /hdhive/resource/:slug/cloud189` | **已解锁资源**的网盘链接 |
+
+### 会消耗积分的接口（谨慎调用）
+
+| 接口 | 副作用 |
+|------|--------|
+| `POST /hdhive/unlock/tmdb/:id` | 解锁 + 扣积分 |
+| `POST /hdhive/unlock/resource/:slug` | 解锁 + 扣积分 |
+| `POST /hdhive/unlock/share` | 解锁 + 扣积分 |
+
+### 积分不足的处理
+
+影巢服务器在积分不足时会返回错误，不会强行扣分。建议：
+
+```js
+try {
+  const result = await client.unlockByTmdbId(tmdbId);
+  // 处理成功
+} catch (e) {
+  if (e.message.includes('积分不足') || e.message.includes('points')) {
+    console.log('积分不足，跳过');
+    // 可以调用 checkin() 增加积分
+    await client.checkin();
+  }
+}
+```
+
+---
+
+## 完整示例
+
+### 示例 1：批量解锁多个 TMDB 电影（含积分保护）
+
+参考上方 [确认调用流程](#-确认调用流程积分保护) 章节的"批量解锁 + 积分预算"示例。**建议**：
+
+```js
+import { HdhiveClient } from './api-client.mjs';
+import fs from 'node:fs';
+
+const cookie = fs.readFileSync('/tmp/hdhive-cookies.txt', 'utf8').trim();
+const client = new HdhiveClient({ baseUrl: 'https://hdhive.com', cookie });
+
+const tmdbIds = [372058, 550, 129, 13, 680];
+const POINTS_BUDGET = 50;
+let totalSpent = 0;
+
+for (const tmdbId of tmdbIds) {
+  // ✅ 先预览（不消耗积分）
+  const preview = await client.previewTmdb(tmdbId, 'movie');
+  if (!preview.success || preview.resources.length === 0) {
+    console.log(`⊘ TMDB ${tmdbId}: 无资源`);
+    continue;
+  }
+
+  // 预算检查
+  if (totalSpent + preview.cheapestCost > POINTS_BUDGET) {
+    console.log(`⊘ TMDB ${tmdbId}: 预算不足`);
+    continue;
+  }
+
+  // ✅ 再解锁（消耗积分）
+  try {
+    const result = await client.unlockByTmdbId(tmdbId, 'movie');
+    totalSpent += preview.cheapestCost;
     console.log(`✓ TMDB ${tmdbId}: ${result.cloud189.fullText}`);
   } catch (e) {
     console.error(`✗ TMDB ${tmdbId}: ${e.message}`);
   }
 }
 
+console.log(`\n总共花费 ${totalSpent} 积分`);
 await client.close();
 ```
 
