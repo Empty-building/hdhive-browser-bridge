@@ -1,5 +1,6 @@
 # HDHive API 服务 Docker 镜像
 # 包装 api-client.mjs 为 REST API
+# 与 cloud189-auto-save 兼容的 Browser Bridge 接口
 
 FROM mcr.microsoft.com/playwright:v1.49.1-noble
 
@@ -21,10 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-# 复制源码
+# 复制源码（只需运行文件：api-client.mjs 和 server.mjs）
 COPY api-client.mjs ./
 COPY server.mjs ./
-COPY example.mjs ./
 
 # 创建临时目录（用于浏览器 profile 和 cookie 缓存）
 RUN mkdir -p /tmp/hdhive-cache && chmod 777 /tmp/hdhive-cache
