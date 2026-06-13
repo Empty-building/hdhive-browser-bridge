@@ -76,6 +76,9 @@ docker-compose logs -f hdhive-api
 | `ACTION_TIMEOUT_MS` | ❌ | `180000` | 单个接口超时（毫秒）|
 | `AUTO_WARMUP` | ❌ | `true` | 启动时自动预热浏览器 |
 | `PORT` | ❌ | `10000` | HTTP 端口 |
+| `DATABASE_URL` | ❌ | 空 | Postgres 连接串。**设置后启用 cookie 持久化** |
+| `BRIDGE_STATE_SECRET` | ❌ | `BRIDGE_TOKEN` | 加密密钥（用于数据库存储 cookie）|
+| `COOKIE_KEY` | ❌ | `default` | 数据库中 cookie 的 key（多实例时区分）|
 
 ### Cookie 传递优先级
 
@@ -118,6 +121,93 @@ docker run -d --name hdhive-api -p 10000:10000 \
   -e HDHIVE_COOKIE="$COOKIE" \
   hdhive-api:latest
 ```
+
+---
+
+## 🗄️ 数据库持久化（推荐生产部署）
+
+设置 `DATABASE_URL` 后，cookie 会**加密保存**到 Postgres，容器重启后自动恢复。
+
+### 快速启用（docker-compose 一键）
+
+```bash
+# 1. 准备 .env
+cat > .env <<EOF
+BRIDGE_TOKEN=your-strong-token
+BRIDGE_STATE_SECRET=$(openssl rand -hex 32)
+POSTGRES_PASSWORD=hdhive_secret
+EOF
+
+# 2. 启动（自动包含 Postgres）
+docker-compose up -d
+
+# 3. 首次登录（会自动写入数据库）
+COOKIE=$(curl -s -X POST -H "x-bridge-token: $(grep BRIDGE_TOKEN .env | cut -d= -f2)" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"you@email.com","password":"your-pass"}' \
+  http://localhost:10000/hdhive/login | jq -r '.data.cookie')
+
+# 4. 验证数据库中有 cookie
+curl -H "x-bridge-token: $(grep BRIDGE_TOKEN .env | cut -d= -f2)" \
+  http://localhost:10000/admin/cookies
+```
+
+### 行为说明
+
+| 启动场景 | 行为 |
+|---------|------|
+| 启动时 DB 无 cookie + env 有 `HDHIVE_COOKIE` | **自动保存** env cookie 到 DB |
+| 启动时 DB 有 cookie + env 无 `HDHIVE_COOKIE` | **自动加载** DB cookie 作为默认 |
+| 启动时 DB 有 cookie + env 有 `HDHIVE_COOKIE` | 优先用 env，DB 保留 |
+| 调用 `POST /hdhive/login` | 登录后**自动加密保存**到 DB |
+| 调用 `POST /admin/cookies/:key` | 手动设置（无登录直接写）|
+
+### 数据库表结构
+
+```sql
+CREATE TABLE hdhive_cookies (
+  key TEXT PRIMARY KEY,                -- COOKIE_KEY 配置
+  cookie_encrypted TEXT NOT NULL,      -- AES-256-GCM 加密
+  meta JSONB DEFAULT '{}'::jsonb,      -- 元数据（hdh_uid, source, ua）
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### 加密方案
+
+- **算法**：AES-256-GCM
+- **密钥**：从 `BRIDGE_STATE_SECRET` 派生（SHA-256）
+- **IV**：每次加密随机生成（12 bytes）
+- **认证**：`authTag` 防止篡改
+- **存储格式**：`base64(iv + authTag + ciphertext)`，约 150% 原文大小
+
+### 多实例/多账号支持
+
+用 `COOKIE_KEY` 区分不同 cookie：
+
+```bash
+# 实例 1：保存 user A 的 cookie
+COOKIE_KEY=user-a docker run ... hdhive-api:latest
+
+# 实例 2：保存 user B 的 cookie（不同容器端口）
+COOKIE_KEY=user-b docker run -p 10001:10000 ... hdhive-api:latest
+
+# 或同一实例多账号（手动调用）
+curl -X POST -H "x-bridge-token: xxx" \
+  -d '{"cookie":"...","key":"user-b"}' \
+  http://localhost:10000/admin/cookies/user-b
+```
+
+### 数据迁移
+
+```bash
+# 从一个环境迁移 cookie 到另一个
+docker exec hdhive-postgres pg_dump -t hdhive_cookies > cookies.sql
+docker exec -i hdhive-postgres-new psql < cookies.sql
+```
+
+---
 
 ---
 
@@ -193,6 +283,45 @@ curl -X POST -H "x-bridge-token: xxx" \
   -H "Content-Type: application/json" \
   -d '{}' \
   http://localhost:10000/browser/restart
+```
+
+#### `GET /admin/cookies`
+列出所有保存的 cookie keys（不含明文）。
+
+```bash
+curl -H "x-bridge-token: xxx" http://localhost:10000/admin/cookies
+```
+
+返回：
+```json
+{
+  "success": true,
+  "data": {
+    "enabled": true,
+    "cookies": [
+      { "key": "default", "meta": { "source": "login" }, "created_at": "...", "updated_at": "...", "hasCookie": true }
+    ],
+    "count": 1
+  }
+}
+```
+
+#### `POST /admin/cookies/:key`
+手动设置 cookie 到数据库（无需登录）。
+
+```bash
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"cookie":"hdh_sa_token=xxx; token=eyJ...; csrf_access_token=xxx; hdh_uid=xxx"}' \
+  http://localhost:10000/admin/cookies/default
+```
+
+#### `DELETE /admin/cookies/:key`
+删除指定 key 的 cookie。
+
+```bash
+curl -X DELETE -H "x-bridge-token: xxx" \
+  http://localhost:10000/admin/cookies/default
 ```
 
 ### Customer API（兼容原 bridge）

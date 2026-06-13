@@ -6,6 +6,8 @@ import express from 'express';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import pg from 'pg';
 import { HdhiveClient, STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT } from './api-client.mjs';
 
 const config = {
@@ -17,7 +19,13 @@ const config = {
   // 接口超时（单个请求最长执行时间）
   actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 180_000),
   // 是否启用自动 warmup
-  autoWarmup: process.env.AUTO_WARMUP !== 'false'
+  autoWarmup: process.env.AUTO_WARMUP !== 'false',
+  // 数据库配置
+  databaseUrl: String(process.env.DATABASE_URL || process.env.BRIDGE_STATE_DATABASE_URL || ''),
+  // 加密密钥（用于加密 cookie 存储）
+  encryptSecret: String(process.env.BRIDGE_STATE_SECRET || process.env.BRIDGE_TOKEN || ''),
+  // cookie key 前缀（区分不同 Bridge 实例）
+  cookieKey: String(process.env.COOKIE_KEY || process.env.BRIDGE_STATE_KEY || 'default')
 };
 
 // 全局状态
@@ -71,11 +79,147 @@ function getClient(cookieOverride) {
   return state.client;
 }
 
-// 工具函数：获取请求 cookie（优先级：body.cookie > header > env）
-function getRequestCookie(req) {
-  return req.body?.cookie
-      || req.get('x-hdhive-cookie')
-      || config.defaultCookie;
+// 工具函数：获取请求 cookie（优先级：body.cookie > header > env > database）
+async function getRequestCookieAsync(req) {
+  const fromBody = req.body?.cookie;
+  const fromHeader = req.get('x-hdhive-cookie');
+  if (fromBody) return fromBody;
+  if (fromHeader) return fromHeader;
+  if (config.defaultCookie) return config.defaultCookie;
+  // 从数据库 fallback
+  if (dbState.initialized) {
+    return await loadCookieFromDb(config.cookieKey);
+  }
+  return '';
+}
+
+// ─────────────────── 数据库持久化 cookie ───────────────────
+
+const dbState = {
+  pool: null,
+  initialized: false,
+  schema: `
+    CREATE TABLE IF NOT EXISTS hdhive_cookies (
+      key TEXT PRIMARY KEY,
+      cookie_encrypted TEXT NOT NULL,
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `
+};
+
+function getEncryptionKey(secret) {
+  if (!secret) return null;
+  return createHash('sha256').update(String(secret)).digest();
+}
+
+function encryptCookie(plaintext, secret) {
+  const key = getEncryptionKey(secret);
+  if (!key) throw new Error('BRIDGE_STATE_SECRET or BRIDGE_TOKEN must be set for encrypted cookie storage');
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, authTag, encrypted]).toString('base64');
+}
+
+function decryptCookie(ciphertext, secret) {
+  const key = getEncryptionKey(secret);
+  if (!key) throw new Error('BRIDGE_STATE_SECRET or BRIDGE_TOKEN must be set for encrypted cookie storage');
+  const data = Buffer.from(ciphertext, 'base64');
+  const iv = data.subarray(0, 12);
+  const authTag = data.subarray(12, 28);
+  const encrypted = data.subarray(28);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+}
+
+async function initDatabase() {
+  if (!config.databaseUrl) return false;
+  if (dbState.initialized) return true;
+
+  try {
+    dbState.pool = new pg.Pool({
+      connectionString: config.databaseUrl,
+      ssl: config.databaseUrl.includes('sslmode=require') ? { rejectUnauthorized: false } : false,
+      max: 5,
+      idleTimeoutMillis: 30000
+    });
+    await dbState.pool.query(dbState.schema);
+    dbState.initialized = true;
+    console.log('[hdhive-api] database connected');
+    return true;
+  } catch (e) {
+    console.error('[hdhive-api] database connection failed:', e.message);
+    dbState.pool = null;
+    return false;
+  }
+}
+
+async function saveCookieToDb(key, cookie, meta = {}) {
+  if (!dbState.initialized || !config.encryptSecret) {
+    return { saved: false, reason: 'database or encryption not configured' };
+  }
+  try {
+    const encrypted = encryptCookie(cookie, config.encryptSecret);
+    await dbState.pool.query(
+      `INSERT INTO hdhive_cookies (key, cookie_encrypted, meta, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (key) DO UPDATE SET
+         cookie_encrypted = EXCLUDED.cookie_encrypted,
+         meta = EXCLUDED.meta,
+         updated_at = NOW()`,
+      [key, encrypted, meta]
+    );
+    return { saved: true };
+  } catch (e) {
+    return { saved: false, reason: e.message };
+  }
+}
+
+async function loadCookieFromDb(key) {
+  if (!dbState.initialized) return null;
+  try {
+    const r = await dbState.pool.query(
+      'SELECT cookie_encrypted FROM hdhive_cookies WHERE key = $1',
+      [key]
+    );
+    if (r.rows.length === 0) return null;
+    return decryptCookie(r.rows[0].cookie_encrypted, config.encryptSecret);
+  } catch (e) {
+    console.error('[hdhive-api] load cookie failed:', e.message);
+    return null;
+  }
+}
+
+async function deleteCookieFromDb(key) {
+  if (!dbState.initialized) return false;
+  try {
+    const r = await dbState.pool.query('DELETE FROM hdhive_cookies WHERE key = $1', [key]);
+    return r.rowCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function listCookiesFromDb() {
+  if (!dbState.initialized) return [];
+  try {
+    const r = await dbState.pool.query(
+      'SELECT key, meta, created_at, updated_at FROM hdhive_cookies ORDER BY updated_at DESC'
+    );
+    return r.rows.map(row => ({
+      key: row.key,
+      meta: row.meta,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      hasCookie: true
+    }));
+  } catch {
+    return [];
+  }
 }
 
 // 通用 API 调用封装（带超时）
@@ -169,7 +313,7 @@ app.post('/warmup', async (req, res) => {
 // 当前用户
 app.get('/hdhive/customer/current', async (req, res) => {
   const r = await withTimeout('customer/current', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getCurrentUser();
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -178,7 +322,7 @@ app.get('/hdhive/customer/current', async (req, res) => {
 // 积分日志
 app.get('/hdhive/customer/points-logs', async (req, res) => {
   const r = await withTimeout('customer/points-logs', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getPointsLogs(req.query);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -187,7 +331,7 @@ app.get('/hdhive/customer/points-logs', async (req, res) => {
 // 签到
 app.post('/hdhive/customer/checkin', async (req, res) => {
   const r = await withTimeout('customer/checkin', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.checkin();
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -196,7 +340,7 @@ app.post('/hdhive/customer/checkin', async (req, res) => {
 // 未读消息数
 app.get('/hdhive/customer/messages/unread-count', async (req, res) => {
   const r = await withTimeout('customer/messages/unread-count', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getUnreadCount();
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -205,7 +349,7 @@ app.get('/hdhive/customer/messages/unread-count', async (req, res) => {
 // 我的播放列表
 app.get('/hdhive/customer/playlists/my', async (req, res) => {
   const r = await withTimeout('customer/playlists/my', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.call('GET', '/api/customer/playlists/my', { query: req.query });
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -214,7 +358,7 @@ app.get('/hdhive/customer/playlists/my', async (req, res) => {
 // 订阅检查
 app.post('/hdhive/customer/subscriptions/check', async (req, res) => {
   const r = await withTimeout('customer/subscriptions/check', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.call('GET', '/api/customer/subscriptions/check', {
       query: req.body?.query || req.body
     });
@@ -225,7 +369,7 @@ app.post('/hdhive/customer/subscriptions/check', async (req, res) => {
 // 资源详情
 app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
   const r = await withTimeout('customer/resources', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getResource(req.params.resourceId);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -234,7 +378,7 @@ app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
 // 解锁资源
 app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
   const r = await withTimeout('customer/resources/unlock', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.unlockResource(req.params.resourceId);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -243,7 +387,7 @@ app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
 // 检查资源
 app.post('/hdhive/customer/check/resource', async (req, res) => {
   const r = await withTimeout('customer/check/resource', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.checkResource(req.body?.url);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -252,7 +396,7 @@ app.post('/hdhive/customer/check/resource', async (req, res) => {
 // 通用 customer API 代理
 app.post('/hdhive/customer/:action*', async (req, res) => {
   const r = await withTimeout(`customer/${req.params.action}`, async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
     const method = req.method;
     return await client.call(method, path, {
@@ -265,7 +409,7 @@ app.post('/hdhive/customer/:action*', async (req, res) => {
 
 app.get('/hdhive/customer/:action*', async (req, res) => {
   const r = await withTimeout(`customer/${req.params.action}`, async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
     return await client.call('GET', path, { query: req.query });
   });
@@ -276,7 +420,7 @@ app.get('/hdhive/customer/:action*', async (req, res) => {
 
 app.get('/hdhive/public/bulletins/latest', async (req, res) => {
   const r = await withTimeout('public/bulletins/latest', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getBulletins();
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -360,6 +504,17 @@ app.post('/hdhive/login', async (req, res) => {
         userInfo = { hdh_uid: u };
       } catch {}
 
+      // 自动持久化到数据库（如果配置了）
+      let dbSaved = null;
+      const saveKey = req.body?.key || config.cookieKey;
+      if (dbState.initialized) {
+        dbSaved = await saveCookieToDb(saveKey, cookieHeader, {
+          hdh_uid: userInfo?.hdh_uid,
+          source: 'login',
+          ua: req.get('user-agent')?.slice(0, 200)
+        });
+      }
+
       return {
         cookie: cookieHeader,
         cookies: cookies.map(c => ({
@@ -371,7 +526,11 @@ app.post('/hdhive/login', async (req, res) => {
           secure: c.secure
         })),
         user: userInfo,
-        note: '保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用'
+        persisted: dbSaved,
+        key: saveKey,
+        note: dbSaved?.saved
+          ? '✓ Cookie 已加密保存到数据库，下次启动自动恢复'
+          : '保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用'
       };
     } finally {
       await ctx.close().catch(() => {});
@@ -418,13 +577,53 @@ app.post('/browser/restart', async (req, res) => {
   res.status(r.success ? 200 : 500).json(r);
 });
 
+// ─────────────────── Cookie 管理（数据库）───────────────────
+
+// 列出所有保存的 cookie keys（不含明文）
+app.get('/admin/cookies', async (req, res) => {
+  const r = await withTimeout('admin/cookies/list', async () => {
+    if (!dbState.initialized) {
+      return { enabled: false, cookies: [], message: 'database not configured' };
+    }
+    const cookies = await listCookiesFromDb();
+    return { enabled: true, cookies, count: cookies.length };
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 删除指定 key 的 cookie
+app.delete('/admin/cookies/:key', async (req, res) => {
+  const r = await withTimeout('admin/cookies/delete', async () => {
+    if (!dbState.initialized) throw new Error('database not configured');
+    const deleted = await deleteCookieFromDb(req.params.key);
+    return { deleted };
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 手动设置 cookie（不需要登录，直接写入数据库）
+app.post('/admin/cookies/:key', async (req, res) => {
+  const r = await withTimeout('admin/cookies/set', async () => {
+    if (!dbState.initialized) throw new Error('database not configured');
+    if (!config.encryptSecret) throw new Error('BRIDGE_STATE_SECRET or BRIDGE_TOKEN must be set');
+    const { cookie } = req.body || {};
+    if (!cookie) throw new Error('cookie is required in body');
+    const result = await saveCookieToDb(req.params.key, cookie, {
+      source: 'manual',
+      ua: req.get('user-agent')?.slice(0, 200)
+    });
+    return result;
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
 // ─────────────────── ★ 一键解锁（核心接口）───────────────────
 
 // TMDB ID 一键解锁：解析 → 找资源 → 解锁 → 拿网盘
 // ⚠️ 此接口会消耗积分！未解锁的资源需要积分
 app.post('/hdhive/unlock/tmdb/:tmdbId', async (req, res) => {
   const r = await withTimeout('unlock/tmdb', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     const type = req.body?.type || req.query.type || 'movie';
     return await client.unlockByTmdbId(Number(req.params.tmdbId), type);
   });
@@ -435,7 +634,7 @@ app.post('/hdhive/unlock/tmdb/:tmdbId', async (req, res) => {
 // ✅ 推荐先调用这个，确认后再决定是否解锁
 app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
   const r = await withTimeout('preview/tmdb', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     const type = req.body?.type || req.query.type || 'movie';
 
     // 解析 TMDB → 影巢内部 URL
@@ -490,7 +689,7 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
 // Resource slug 一键解锁 + 拿网盘
 app.post('/hdhive/unlock/resource/:slug', async (req, res) => {
   const r = await withTimeout('unlock/resource', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.unlockByResourceSlug(req.params.slug);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -499,7 +698,7 @@ app.post('/hdhive/unlock/resource/:slug', async (req, res) => {
 // Movie URL 一键解锁
 app.post('/hdhive/unlock/share', async (req, res) => {
   const r = await withTimeout('unlock/share', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     const { url, movieId } = req.body || {};
     if (!url) throw new Error('url is required');
     return await client.unlockByShareUrl(url, movieId);
@@ -510,7 +709,7 @@ app.post('/hdhive/unlock/share', async (req, res) => {
 // 单独提取 189 网盘链接（resource slug）
 app.get('/hdhive/resource/:slug/cloud189', async (req, res) => {
   const r = await withTimeout('resource/cloud189', async () => {
-    const client = getClient(getRequestCookie(req));
+    const client = getClient(await getRequestCookieAsync(req));
     return await client.getCloud189Links(req.params.slug);
   });
   res.status(r.success ? 200 : 500).json(r);
@@ -523,6 +722,28 @@ app.listen(config.port, '0.0.0.0', async () => {
   console.log(`[hdhive-api] baseUrl=${config.baseUrl} headless=${config.headless}`);
   console.log(`[hdhive-api] BRIDGE_TOKEN=${config.bridgeToken ? 'set' : 'EMPTY (public)'}`);
   console.log(`[hdhive-api] HDHIVE_COOKIE=${config.defaultCookie ? 'set' : 'EMPTY (need to pass per-request)'}`);
+
+  // 初始化数据库（可选）
+  if (config.databaseUrl) {
+    const dbOk = await initDatabase();
+    console.log(`[hdhive-api] DATABASE_URL=${dbOk ? 'connected' : 'FAILED'}`);
+    if (dbOk && config.cookieKey) {
+      // 启动时：如果 DB 没有 cookie 但 env 有，自动保存到 DB
+      const existingDbCookie = await loadCookieFromDb(config.cookieKey);
+      if (!existingDbCookie && config.defaultCookie) {
+        const saved = await saveCookieToDb(config.cookieKey, config.defaultCookie, { source: 'env-on-startup' });
+        console.log(`[hdhive-api] ✓ Cookie auto-saved to DB from env: ${saved.saved}`);
+      } else if (existingDbCookie && !config.defaultCookie) {
+        // 从数据库加载
+        config.defaultCookie = existingDbCookie;
+        console.log(`[hdhive-api] ✓ Loaded cookie from database (key=${config.cookieKey}, ${existingDbCookie.length} chars)`);
+      } else {
+        console.log(`[hdhive-api] cookie already in DB for key=${config.cookieKey}`);
+      }
+    }
+  } else {
+    console.log(`[hdhive-api] DATABASE_URL=EMPTY (cookie not persisted)`);
+  }
 
   if (config.autoWarmup && config.defaultCookie) {
     console.log('[hdhive-api] auto warmup...');

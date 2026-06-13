@@ -1,6 +1,21 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: hdhive-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hdhive_secret}
+      POSTGRES_DB: hdhive
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   hdhive-api:
     build: .
     image: hdhive-api:latest
@@ -8,13 +23,24 @@ services:
     restart: unless-stopped
     ports:
       - "10000:10000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       # 必需：保护 API 的 token
       - BRIDGE_TOKEN=${BRIDGE_TOKEN:-test-token-local}
 
-      # 可选：默认 cookie（如果设置，所有请求默认用这个 cookie）
-      # 如果不设置，每个请求需要 body.cookie 或 x-hdhive-cookie 头
+      # 可选：默认 cookie（如果设置，会自动保存到数据库）
       - HDHIVE_COOKIE=${HDHIVE_COOKIE:-}
+
+      # 加密密钥（用于数据库存储 cookie）
+      - BRIDGE_STATE_SECRET=${BRIDGE_STATE_SECRET:-change-me-in-production}
+
+      # Postgres 连接（启用数据库持久化）
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-hdhive_secret}@postgres:5432/hdhive
+
+      # cookie 存储 key（多实例时区分）
+      - COOKIE_KEY=${COOKIE_KEY:-default}
 
       # 可选：影巢基础 URL
       - HDHIVE_BASE_URL=${HDHIVE_BASE_URL:-https://hdhive.com}
@@ -25,11 +51,10 @@ services:
       # 可选：单个接口超时（毫秒）
       - ACTION_TIMEOUT_MS=${ACTION_TIMEOUT_MS:-180000}
 
-      # 可选：是否启动时自动预热（需要 HDHIVE_COOKIE）
+      # 可选：是否启动时自动预热
       - AUTO_WARMUP=${AUTO_WARMUP:-true}
 
     volumes:
-      # 持久化浏览器状态（cookie、缓存）
       - hdhive-data:/tmp/hdhive-cache
 
     healthcheck:
@@ -46,5 +71,7 @@ services:
         max-file: "3"
 
 volumes:
+  postgres-data:
+    driver: local
   hdhive-data:
     driver: local
