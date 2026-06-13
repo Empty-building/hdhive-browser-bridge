@@ -254,6 +254,42 @@ export class HdhiveClient {
     return this.call('POST', `/api/customer/resources/${slugOrId}/unlock`);
   }
 
+  // ─── 便捷方法 ───
+
+  async getCurrentUser() {
+    return this.call('GET', '/api/customer/user/current');
+  }
+
+  async getPointsLogs(query = {}) {
+    return this.call('GET', '/api/customer/points-logs', { query });
+  }
+
+  async checkin() {
+    return this.call('POST', '/api/customer/user/checkin');
+  }
+
+  async getUnreadCount() {
+    return this.call('GET', '/api/customer/messages/unread-count');
+  }
+
+  async getBulletins() {
+    return this.call('GET', '/api/public/bulletins/latest');
+  }
+
+  async checkResource(url) {
+    return this.call('POST', '/api/customer/check/resource', { body: { url } });
+  }
+
+  async getPlaylists(query = {}) {
+    return this.call('GET', '/api/customer/playlists/my', { query });
+  }
+
+  async checkSubscription(target_type, target_key) {
+    return this.call('GET', '/api/customer/subscriptions/check', {
+      query: { target_type, target_key }
+    });
+  }
+
   /**
    * 通过 TMDB ID 解析影巢内部 URL（**无需登录**）
    * 拦截第一次重定向（/tmdb/movie/{id} → /movie/{内部slug}）就停止

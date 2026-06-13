@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  hdhive-api:
+    build: .
+    image: hdhive-api:latest
+    container_name: hdhive-api
+    restart: unless-stopped
+    ports:
+      - "10000:10000"
+    environment:
+      # 必需：保护 API 的 token
+      - BRIDGE_TOKEN=${BRIDGE_TOKEN:-test-token-local}
+
+      # 可选：默认 cookie（如果设置，所有请求默认用这个 cookie）
+      # 如果不设置，每个请求需要 body.cookie 或 x-hdhive-cookie 头
+      - HDHIVE_COOKIE=${HDHIVE_COOKIE:-}
+
+      # 可选：影巢基础 URL
+      - HDHIVE_BASE_URL=${HDHIVE_BASE_URL:-https://hdhive.com}
+
+      # 可选：浏览器配置
+      - BROWSER_HEADLESS=${BROWSER_HEADLESS:-true}
+
+      # 可选：单个接口超时（毫秒）
+      - ACTION_TIMEOUT_MS=${ACTION_TIMEOUT_MS:-180000}
+
+      # 可选：是否启动时自动预热（需要 HDHIVE_COOKIE）
+      - AUTO_WARMUP=${AUTO_WARMUP:-true}
+
+    volumes:
+      # 持久化浏览器状态（cookie、缓存）
+      - hdhive-data:/tmp/hdhive-cache
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:10000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hdhive-data:
+    driver: local

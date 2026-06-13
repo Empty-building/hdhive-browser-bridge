@@ -1,2785 +1,352 @@
+// server.mjs
+// hdhive-api HTTP 服务：把 api-client.mjs 包装成 REST API
+// 与 hdhive-browser-bridge 兼容，提供相同的 /hdhive/* 接口 + 新增 TMDB 一键解锁
+
 import express from 'express';
-import { chromium } from 'playwright';
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
-import os from 'node:os';
+import { HdhiveClient } from './api-client.mjs';
 
 const config = {
   port: Number(process.env.PORT || 10000),
-  baseUrl: trimTrailingSlash(process.env.HDHIVE_BASE_URL || 'https://hdhive.com'),
-  cookie: String(process.env.HDHIVE_COOKIE || ''),
-  username: String(process.env.HDHIVE_USERNAME || ''),
-  password: String(process.env.HDHIVE_PASSWORD || ''),
   bridgeToken: String(process.env.BRIDGE_TOKEN || ''),
-  profileDir: String(process.env.BROWSER_PROFILE_DIR || '/data/hdhive-profile'),
+  defaultCookie: String(process.env.HDHIVE_COOKIE || ''),
+  baseUrl: String(process.env.HDHIVE_BASE_URL || 'https://hdhive.com'),
   headless: process.env.BROWSER_HEADLESS !== 'false',
-  keepAliveIntervalMs: Number(process.env.KEEPALIVE_INTERVAL_MS || 25_000),
-  warmupIntervalMs: Number(process.env.WARMUP_INTERVAL_MS || 300_000),
-  navigationTimeoutMs: Number(process.env.NAVIGATION_TIMEOUT_MS || 30_000),
-  loginTimeoutMs: Number(process.env.LOGIN_TIMEOUT_MS || 45_000),
-  customerApiTimeoutMs: Number(process.env.CUSTOMER_API_TIMEOUT_MS || 30_000),
-  actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 120_000),
-  idlePageUrl: process.env.IDLE_PAGE_URL || '/',
-  warmupUrls: parseWarmupUrls(process.env.WARMUP_URLS || '/,/search'),
-  maxHtmlChars: Number(process.env.MAX_HTML_CHARS || 0),
-  stateDatabaseUrl: String(process.env.BRIDGE_STATE_DATABASE_URL || process.env.DATABASE_URL || ''),
-  stateDatabaseSsl: String(process.env.BRIDGE_STATE_DATABASE_SSL || ''),
-  stateKey: String(process.env.BRIDGE_STATE_KEY || 'hdhive-default'),
-  stateSecret: String(process.env.BRIDGE_STATE_SECRET || process.env.BRIDGE_TOKEN || '')
+  // 接口超时（单个请求最长执行时间）
+  actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 180_000),
+  // 是否启用自动 warmup
+  autoWarmup: process.env.AUTO_WARMUP !== 'false'
 };
 
+// 全局状态
 const state = {
   startedAt: Date.now(),
-  context: null,
-  page: null,
-  browserLaunchAt: 0,
-  browserLaunchMs: 0,
-  lastWarmupAt: 0,
-  lastWarmupMs: 0,
-  lastWarmupOk: false,
-  lastWarmupError: '',
-  warmupCount: 0,
-  restartCount: 0,
+  client: null,
+  lastSuccess: null,
+  lastError: null,
+  totalCalls: 0,
+  failedCalls: 0,
+  warmupAt: null,
+  warmupOk: false,
   activeAction: null,
-  actionQueue: Promise.resolve(),
-  stateDbPool: null,
-  stateDbInitialized: false,
-  stateLoadedAt: 0,
-  statePersistedAt: 0,
-  stateLoadOk: false,
-  statePersistOk: false,
-  stateLastError: '',
-  shuttingDown: false,
-  lastLoginVerifyAt: 0,
-  loginFailureCount: 0,
-  loginFailureWindowStart: 0
+  browserLaunching: false
 };
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// Token 校验中间件
 app.use((req, res, next) => {
-  if (!config.bridgeToken || req.path === '/health') {
-    next();
-    return;
-  }
-
+  if (!config.bridgeToken || req.path === '/health') return next();
   const provided = req.get('x-bridge-token') || req.query.token;
   if (provided !== config.bridgeToken) {
-    res.status(401).json({ success: false, error: 'unauthorized' });
-    return;
+    return res.status(401).json({ success: false, error: 'unauthorized' });
   }
   next();
 });
 
+// 获取或创建 client（带 cookie）
+function getClient(cookieOverride) {
+  const cookie = cookieOverride || config.defaultCookie;
+  if (!cookie) {
+    throw new Error('no cookie available: set HDHIVE_COOKIE env or pass cookie in body/header');
+  }
+  if (!state.client) {
+    state.client = new HdhiveClient({
+      baseUrl: config.baseUrl,
+      cookie,
+      headless: config.headless
+    });
+  } else if (state.client.cookie !== cookie) {
+    // 如果 cookie 变了，重建 client
+    state.client.close().catch(() => {});
+    state.client = new HdhiveClient({
+      baseUrl: config.baseUrl,
+      cookie,
+      headless: config.headless
+    });
+  }
+  return state.client;
+}
+
+// 工具函数：获取请求 cookie（优先级：body.cookie > header > env）
+function getRequestCookie(req) {
+  return req.body?.cookie
+      || req.get('x-hdhive-cookie')
+      || config.defaultCookie;
+}
+
+// 通用 API 调用封装（带超时）
+async function withTimeout(actionName, fn) {
+  state.activeAction = { name: actionName, startedAt: Date.now() };
+  let timeoutHandle;
+  try {
+    const result = await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`action ${actionName} timed out after ${config.actionTimeoutMs}ms`)),
+          config.actionTimeoutMs
+        );
+      })
+    ]);
+    state.lastSuccess = Date.now();
+    state.totalCalls++;
+    return { success: true, data: result };
+  } catch (e) {
+    state.lastError = e.message;
+    state.failedCalls++;
+    return { success: false, error: e.message };
+  } finally {
+    clearTimeout(timeoutHandle);
+    state.activeAction = null;
+  }
+}
+
+// ─────────────────── 生命周期接口 ───────────────────
+
+// 健康检查（无需 token）
 app.get('/health', async (req, res) => {
-  const ready = Boolean(state.context && state.page);
+  const ready = Boolean(state.client && state.warmupOk);
   res.status(ready ? 200 : 503).json({
     success: ready,
-    data: await buildStatus()
+    status: ready ? 'healthy' : 'warming_up',
+    uptime: Date.now() - state.startedAt,
+    totalCalls: state.totalCalls,
+    failedCalls: state.failedCalls,
+    lastSuccess: state.lastSuccess,
+    lastError: state.lastError,
+    activeAction: state.activeAction?.name || null
   });
 });
 
-app.get('/metrics', async (req, res) => {
-  res.json({ success: true, data: await buildStatus() });
-});
-
-app.post('/warmup', async (req, res) => {
-  const urls = Array.isArray(req.body?.urls) && req.body.urls.length > 0
-    ? req.body.urls.map(String)
-    : config.warmupUrls;
-  const result = await enqueueAction('warmup', () => warmup(urls));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/warmup', async (req, res) => {
-  const urls = typeof req.query.url === 'string' ? [req.query.url] : config.warmupUrls;
-  const result = await enqueueAction('warmup', () => warmup(urls));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/hdhive/status', async (req, res) => {
-  const result = await enqueueAction('hdhive-status', async () => {
-    const page = await ensurePage();
-    const startedAt = Date.now();
-    await page.goto(toAbsoluteUrl(config.idlePageUrl), {
-      waitUntil: 'domcontentloaded',
-      timeout: config.navigationTimeoutMs
-    });
-    const pageStatus = await page.evaluate(() => ({
-      title: document.title,
-      href: location.href,
-      cookiesEnabled: navigator.cookieEnabled,
-      localStorageKeys: Object.keys(localStorage || {}),
-      sessionStorageKeys: Object.keys(sessionStorage || {})
-    }));
-    return {
-      success: true,
-      data: {
-        ...pageStatus,
-        elapsedMs: Date.now() - startedAt
+// 状态指标
+app.get('/metrics', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      startedAt: state.startedAt,
+      uptime: Date.now() - state.startedAt,
+      totalCalls: state.totalCalls,
+      failedCalls: state.failedCalls,
+      successRate: state.totalCalls > 0 ? ((state.totalCalls - state.failedCalls) / state.totalCalls * 100).toFixed(2) + '%' : 'N/A',
+      lastSuccess: state.lastSuccess,
+      lastError: state.lastError,
+      warmupAt: state.warmupAt,
+      warmupOk: state.warmupOk,
+      activeAction: state.activeAction,
+      config: {
+        port: config.port,
+        baseUrl: config.baseUrl,
+        hasToken: Boolean(config.bridgeToken),
+        hasDefaultCookie: Boolean(config.defaultCookie),
+        headless: config.headless
       }
-    };
+    }
   });
-  res.status(result.success ? 200 : 500).json(result);
 });
 
-app.post('/hdhive/open', async (req, res) => {
-  const url = String(req.body?.url || req.body?.path || config.idlePageUrl);
-  const result = await enqueueAction('hdhive-open', () => openPage(url, Boolean(req.body?.includeHtml)));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/hdhive/open', async (req, res) => {
-  const url = String(req.query.url || req.query.path || config.idlePageUrl);
-  const includeHtml = req.query.html === '1' || req.query.html === 'true';
-  const result = await enqueueAction('hdhive-open', () => openPage(url, includeHtml));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/hdhive/cookies', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-cookies', () => getCookieSnapshot());
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/login', requireSensitiveEndpoint, async (req, res) => {
-  const username = String(req.body?.username || config.username || '').trim();
-  const password = String(req.body?.password || config.password || '');
-  const result = await enqueueAction('hdhive-login', () => loginWithPassword(username, password));
-  res.status(result.success ? 200 : 400).json(result);
-});
-
-app.get('/hdhive/customer/current', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-current', () => customerRequest('/api/customer/user/current', {
-    allowUnsignedResponseFallback: true
-  }));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/customer/checkin', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-checkin', () => customerRequest('/api/customer/user/checkin', {
-    method: 'POST',
-    allowUnsignedResponseFallback: true
-  }));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/hdhive/customer/points-logs', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-points-logs', () => customerRequest('/api/customer/points-logs', {
-    query: pickPrimitiveQuery(req.query),
-    allowUnsignedResponseFallback: true
-  }));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/customer/resources', requireSensitiveEndpoint, async (req, res) => {
-  const method = String(req.body?.method || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST';
-  const result = await enqueueAction('hdhive-customer-resources', () => customerRequest('/api/customer/resources', {
-    method,
-    query: pickPrimitiveQuery(req.body?.query),
-    body: req.body?.body
-  }));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/customer/check-resource', requireSensitiveEndpoint, async (req, res) => {
-  const result = await enqueueAction('hdhive-customer-check-resource', () => customerRequest('/api/customer/check/resource', {
-    method: 'POST',
-    body: req.body?.body || req.body
-  }));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/customer/media-resources', requireSensitiveEndpoint, async (req, res) => {
-  const type = String(req.body?.type || '').trim();
-  const tmdbId = String(req.body?.tmdbId || '').trim();
-  const result = await enqueueAction('hdhive-customer-media-resources', () => getMediaResources(type, tmdbId));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.get('/hdhive/customer/resources/:resourceId', requireSensitiveEndpoint, async (req, res) => {
-  const resourceId = normalizeResourceId(req.params.resourceId);
-  const result = await enqueueAction('hdhive-customer-resource', () => getResourceDetail(resourceId));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/hdhive/customer/resources/:resourceId/unlock', requireSensitiveEndpoint, async (req, res) => {
-  const resourceId = normalizeResourceId(req.params.resourceId);
-  const result = await enqueueAction('hdhive-customer-resource-unlock', () => unlockResource(resourceId, req.body?.body));
-  res.status(result.success ? 200 : 500).json(result);
-});
-
-app.post('/browser/restart', async (req, res) => {
-  const result = await enqueueAction('browser-restart', async () => {
-    await closeBrowser('restart');
-    await ensurePage();
-    return { success: true, data: await buildStatus() };
+// 预热：启动浏览器
+app.post('/warmup', async (req, res) => {
+  const r = await withTimeout('warmup', async () => {
+    const cookie = getRequestCookie(req);
+    if (!cookie) throw new Error('no cookie');
+    const client = getClient(cookie);
+    if (!state.client._ready) {
+      await client._ensureBrowser();
+    }
+    state.warmupAt = Date.now();
+    state.warmupOk = true;
+    return { warmed: true, elapsedMs: Date.now() - state.warmupAt };
   });
-  res.status(result.success ? 200 : 500).json(result);
+  res.status(r.success ? 200 : 500).json(r);
 });
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+// ─────────────────── Customer API（兼容原 bridge）───────────────────
+
+// 当前用户
+app.get('/hdhive/customer/current', async (req, res) => {
+  const r = await withTimeout('customer/current', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getCurrentUser();
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 积分日志
+app.get('/hdhive/customer/points-logs', async (req, res) => {
+  const r = await withTimeout('customer/points-logs', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getPointsLogs(req.query);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 签到
+app.post('/hdhive/customer/checkin', async (req, res) => {
+  const r = await withTimeout('customer/checkin', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.checkin();
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 未读消息数
+app.get('/hdhive/customer/messages/unread-count', async (req, res) => {
+  const r = await withTimeout('customer/messages/unread-count', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getUnreadCount();
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 我的播放列表
+app.get('/hdhive/customer/playlists/my', async (req, res) => {
+  const r = await withTimeout('customer/playlists/my', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.call('GET', '/api/customer/playlists/my', { query: req.query });
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 订阅检查
+app.post('/hdhive/customer/subscriptions/check', async (req, res) => {
+  const r = await withTimeout('customer/subscriptions/check', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.call('GET', '/api/customer/subscriptions/check', {
+      query: req.body?.query || req.body
+    });
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 资源详情
+app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
+  const r = await withTimeout('customer/resources', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getResource(req.params.resourceId);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 解锁资源
+app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
+  const r = await withTimeout('customer/resources/unlock', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.unlockResource(req.params.resourceId);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 检查资源
+app.post('/hdhive/customer/check/resource', async (req, res) => {
+  const r = await withTimeout('customer/check/resource', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.checkResource(req.body?.url);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 通用 customer API 代理
+app.post('/hdhive/customer/:action*', async (req, res) => {
+  const r = await withTimeout(`customer/${req.params.action}`, async () => {
+    const client = getClient(getRequestCookie(req));
+    const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
+    const method = req.method;
+    return await client.call(method, path, {
+      query: req.query,
+      body: req.body?.body || (method !== 'GET' ? req.body : undefined)
+    });
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+app.get('/hdhive/customer/:action*', async (req, res) => {
+  const r = await withTimeout(`customer/${req.params.action}`, async () => {
+    const client = getClient(getRequestCookie(req));
+    const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
+    return await client.call('GET', path, { query: req.query });
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// ─────────────────── 公共 API ───────────────────
+
+app.get('/hdhive/public/bulletins/latest', async (req, res) => {
+  const r = await withTimeout('public/bulletins/latest', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getBulletins();
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// ─────────────────── ★ 一键解锁（核心接口）───────────────────
+
+// TMDB ID 一键解锁：解析 → 找资源 → 解锁 → 拿网盘
+app.post('/hdhive/unlock/tmdb/:tmdbId', async (req, res) => {
+  const r = await withTimeout('unlock/tmdb', async () => {
+    const client = getClient(getRequestCookie(req));
+    const type = req.body?.type || req.query.type || 'movie';
+    return await client.unlockByTmdbId(Number(req.params.tmdbId), type);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// Resource slug 一键解锁 + 拿网盘
+app.post('/hdhive/unlock/resource/:slug', async (req, res) => {
+  const r = await withTimeout('unlock/resource', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.unlockByResourceSlug(req.params.slug);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// Movie URL 一键解锁
+app.post('/hdhive/unlock/share', async (req, res) => {
+  const r = await withTimeout('unlock/share', async () => {
+    const client = getClient(getRequestCookie(req));
+    const { url, movieId } = req.body || {};
+    if (!url) throw new Error('url is required');
+    return await client.unlockByShareUrl(url, movieId);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 单独提取 189 网盘链接（resource slug）
+app.get('/hdhive/resource/:slug/cloud189', async (req, res) => {
+  const r = await withTimeout('resource/cloud189', async () => {
+    const client = getClient(getRequestCookie(req));
+    return await client.getCloud189Links(req.params.slug);
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// ─────────────────── 启动 ───────────────────
 
 app.listen(config.port, '0.0.0.0', async () => {
-  console.log(`[browser-bridge] listening on ${config.port}`);
-  console.log(`[browser-bridge] baseUrl=${config.baseUrl} headless=${config.headless} profile=${config.profileDir}`);
-  if (!config.bridgeToken) {
-    console.warn('[browser-bridge] BRIDGE_TOKEN is empty; public endpoints are not protected.');
-  }
+  console.log(`[hdhive-api] listening on ${config.port}`);
+  console.log(`[hdhive-api] baseUrl=${config.baseUrl} headless=${config.headless}`);
+  console.log(`[hdhive-api] BRIDGE_TOKEN=${config.bridgeToken ? 'set' : 'EMPTY (public)'}`);
+  console.log(`[hdhive-api] HDHIVE_COOKIE=${config.defaultCookie ? 'set' : 'EMPTY (need to pass per-request)'}`);
 
-  await enqueueAction('startup-warmup', () => warmup(config.warmupUrls));
-  if (config.username && config.password) {
-    await enqueueAction('startup-login', () => ensureLoggedIn(state.page)).catch((error) => {
-      console.error('[browser-bridge] startup login failed', error);
-    });
+  if (config.autoWarmup && config.defaultCookie) {
+    console.log('[hdhive-api] auto warmup...');
+    try {
+      const client = getClient();
+      await client._ensureBrowser();
+      state.warmupAt = Date.now();
+      state.warmupOk = true;
+      console.log('[hdhive-api] warmup OK');
+    } catch (e) {
+      console.error('[hdhive-api] warmup failed:', e.message);
+    }
   }
-  setInterval(() => {
-    enqueueAction('interval-keepalive', () => keepAlive()).catch((error) => {
-      console.error('[browser-bridge] keepalive failed', error);
-    });
-  }, config.keepAliveIntervalMs).unref();
-  setInterval(() => {
-    enqueueAction('interval-warmup', () => warmup(config.warmupUrls)).catch((error) => {
-      console.error('[browser-bridge] warmup failed', error);
-    });
-  }, config.warmupIntervalMs).unref();
 });
 
-async function enqueueAction(name, action) {
-  const id = randomUUID();
-  const run = async () => {
-    state.activeAction = { id, name, startedAt: Date.now() };
-    try {
-      return await runActionWithTimeout(name, action);
-    } catch (error) {
-      if (error instanceof ActionTimeoutError) {
-        await closeBrowser(`timeout:${name}`, { persist: false });
-      }
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-        data: await buildStatus()
-      };
-    } finally {
-      state.activeAction = null;
-    }
-  };
-
-  const next = state.actionQueue.then(run, run);
-  state.actionQueue = next.then(() => undefined, () => undefined);
-  return next;
-}
-
-class ActionTimeoutError extends Error {
-  constructor(name, timeoutMs) {
-    super(`Bridge action ${name} timed out after ${timeoutMs}ms`);
-    this.name = 'ActionTimeoutError';
-  }
-}
-
-async function runActionWithTimeout(name, action) {
-  const actionPromise = Promise.resolve().then(action);
-  actionPromise.catch(() => undefined);
-  return await Promise.race([
-    actionPromise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new ActionTimeoutError(name, config.actionTimeoutMs)), config.actionTimeoutMs).unref();
-    })
-  ]);
-}
-
-async function ensurePage(retry = 0) {
-  if (state.page && !state.page.isClosed()) {
-    return state.page;
-  }
-
-  if (!state.context) {
-    const startedAt = Date.now();
-    state.context = await chromium.launchPersistentContext(config.profileDir, {
-      headless: config.headless,
-      viewport: { width: 1366, height: 768 },
-      locale: 'zh-CN',
-      timezoneId: 'Asia/Shanghai',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--disable-features=Translate,BackForwardCache'
-      ]
-    });
-
-    state.browserLaunchAt = startedAt;
-    state.browserLaunchMs = Date.now() - startedAt;
-    state.restartCount += 1;
-    // context 崩溃/关闭时主动置空，使下次 ensurePage 能重建（避免在已死的 context 上反复 newPage 失败）
-    state.context.on('close', () => {
-      state.context = null;
-      state.page = null;
-    });
-    await installStealthInitScript(state.context);
-    await restoreBrowserState(state.context);
-    await seedCookies(state.context);
-  }
-
-  try {
-    state.page = state.context.pages()[0] || await state.context.newPage();
-  } catch (error) {
-    // context 已崩溃但引用残留（Target page/context closed）：置空重建，最多重试 2 次
-    state.context = null;
-    state.page = null;
-    if (retry >= 2) {
-      throw error;
-    }
-    return ensurePage(retry + 1);
-  }
-  state.page.setDefaultNavigationTimeout(config.navigationTimeoutMs);
-  state.page.setDefaultTimeout(config.navigationTimeoutMs);
-  state.page.on('close', () => {
-    state.page = null;
-  });
-  return state.page;
-}
-
-async function seedCookies(context) {
-  const cookies = parseCookieHeader(config.cookie, config.baseUrl);
-  if (cookies.length > 0) {
-    await context.addCookies(cookies);
-  }
-}
-
-async function installStealthInitScript(context) {
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
-    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'], configurable: true });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5], configurable: true });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-    if (navigator.userAgentData) {
-      Object.defineProperty(navigator, 'userAgentData', {
-        get: () => ({
-          brands: [
-            { brand: 'Google Chrome', version: '125' },
-            { brand: 'Chromium', version: '125' },
-            { brand: 'Not.A/Brand', version: '24' }
-          ],
-          mobile: false,
-          platform: 'Windows',
-          getHighEntropyValues: async () => ({
-            brands: [
-              { brand: 'Google Chrome', version: '125' },
-              { brand: 'Chromium', version: '125' },
-              { brand: 'Not.A/Brand', version: '24' }
-            ],
-            fullVersionList: [
-              { brand: 'Google Chrome', version: '125.0.0.0' },
-              { brand: 'Chromium', version: '125.0.0.0' },
-              { brand: 'Not.A/Brand', version: '24.0.0.0' }
-            ],
-            mobile: false,
-            platform: 'Windows',
-            platformVersion: '15.0.0',
-            architecture: 'x86',
-            bitness: '64',
-            model: '',
-            uaFullVersion: '125.0.0.0',
-            wow64: false
-          })
-        }),
-        configurable: true
-      });
-    }
-    const patchWebGL = (prototype) => {
-      if (!prototype?.getParameter) {
-        return;
-      }
-      const originalGetParameter = prototype.getParameter;
-      Object.defineProperty(prototype, 'getParameter', {
-        value(parameter) {
-          if (parameter === 37445) {
-            return 'Google Inc. (Intel)';
-          }
-          if (parameter === 37446) {
-            return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-          }
-          return originalGetParameter.call(this, parameter);
-        },
-        configurable: true
-      });
-    };
-    patchWebGL(window.WebGLRenderingContext?.prototype);
-    patchWebGL(window.WebGL2RenderingContext?.prototype);
-    window.chrome = window.chrome || { runtime: {} };
-    for (const key of ['__playwright__binding__', '__pwInitScripts']) {
-      try {
-        delete window[key];
-      } catch {
-        // ignore
-      }
-      try {
-        Object.defineProperty(window, key, {
-          get: () => undefined,
-          set: () => undefined,
-          configurable: true
-        });
-      } catch {
-        // ignore
-      }
-    }
-  });
-}
-
-async function warmup(urls) {
-  const startedAt = Date.now();
-  const page = await ensurePage();
-  const results = [];
-  for (const value of urls) {
-    const url = toAbsoluteUrl(value);
-    const itemStartedAt = Date.now();
-    try {
-      const response = await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: config.navigationTimeoutMs
-      });
-      results.push({
-        url,
-        status: response?.status() || 0,
-        ok: response ? response.ok() : true,
-        title: await page.title().catch(() => ''),
-        elapsedMs: Date.now() - itemStartedAt
-      });
-    } catch (error) {
-      results.push({
-        url,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-        elapsedMs: Date.now() - itemStartedAt
-      });
-    }
-  }
-
-  const failed = results.find((item) => item.ok === false);
-  state.lastWarmupAt = Date.now();
-  state.lastWarmupMs = Date.now() - startedAt;
-  state.lastWarmupOk = !failed;
-  state.lastWarmupError = failed?.error || '';
-  state.warmupCount += 1;
-
-  return {
-    success: !failed,
-    data: {
-      results,
-      status: await buildStatus()
-    },
-    ...(failed ? { error: failed.error || 'warmup failed' } : {})
-  };
-}
-
-let loggingIn = null;
-
-async function ensureLoggedIn(page, options = {}) {
-  if (!config.username || !config.password) {
-    return false;
-  }
-
-  // 检查登录失败次数限制（5分钟内最多失败3次）
-  const now = Date.now();
-  const failureWindowMs = 5 * 60 * 1000; // 5分钟
-  if (state.loginFailureWindowStart && (now - state.loginFailureWindowStart) > failureWindowMs) {
-    // 超过5分钟，重置计数
-    state.loginFailureCount = 0;
-    state.loginFailureWindowStart = 0;
-  }
-  if (state.loginFailureCount >= 3) {
-    const remainingMs = failureWindowMs - (now - state.loginFailureWindowStart);
-    console.warn(`[browser-bridge] 登录失败次数过多，等待 ${Math.ceil(remainingMs / 1000)}秒后重试`);
-    return false;
-  }
-
-  const targetPage = page && !page.isClosed() ? page : await ensurePage();
-  const cookies = await readContextCookies(targetPage.context()).catch(() => []);
-  const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid'];
-  const hasCookie = cookies.some((cookie) => loginCookieNames.includes(cookie.name));
-
-  // 如果要求验证登录态有效性，调用 /api/customer/user/current 确认
-  // 但有验证间隔保护：5分钟内只验证一次，避免频繁请求
-  if (hasCookie && options.verify) {
-    const verifyIntervalMs = 5 * 60 * 1000; // 5分钟
-    if (state.lastLoginVerifyAt && (now - state.lastLoginVerifyAt) < verifyIntervalMs) {
-      // 5分钟内已验证过，直接返回成功
-      return true;
-    }
-
-    console.log('[browser-bridge] 验证登录态有效性...');
-    const currentResult = await customerRequest('/api/customer/user/current', {
-      allowUnsignedResponseFallback: true
-    }).catch(() => ({ success: false }));
-
-    if (currentResult.success && !getCustomerPayloadFailure(currentResult.data?.payload || currentResult.data)) {
-      console.log('[browser-bridge] 登录态有效');
-      state.lastLoginVerifyAt = now; // 记录验证时间
-      // 登录验证成功，重置失败计数
-      state.loginFailureCount = 0;
-      state.loginFailureWindowStart = 0;
-      return true;
-    }
-    console.warn('[browser-bridge] 登录态无效或已过期，需要重新登录');
-  } else if (hasCookie) {
-    return true;
-  }
-
-  if (loggingIn) {
-    return loggingIn;
-  }
-  console.log('[browser-bridge] 登录态缺失或失效，自动使用环境变量账号重新登录');
-  loggingIn = loginWithPassword(config.username, config.password)
-    .then((result) => {
-      if (!result.success) {
-        console.warn('[browser-bridge] 自动登录失败:', result.error || '未知错误');
-        // 记录失败
-        if (!state.loginFailureWindowStart) {
-          state.loginFailureWindowStart = Date.now();
-        }
-        state.loginFailureCount += 1;
-      } else {
-        state.lastLoginVerifyAt = Date.now(); // 登录成功后更新验证时间
-        // 登录成功，重置失败计数
-        state.loginFailureCount = 0;
-        state.loginFailureWindowStart = 0;
-      }
-      return Boolean(result.success);
-    })
-    .catch((error) => {
-      console.warn('[browser-bridge] 自动登录异常:', error instanceof Error ? error.message : String(error));
-      // 记录失败
-      if (!state.loginFailureWindowStart) {
-        state.loginFailureWindowStart = Date.now();
-      }
-      state.loginFailureCount += 1;
-      return false;
-    })
-    .finally(() => {
-      loggingIn = null;
-    });
-  return loggingIn;
-}
-
-async function keepAlive() {
-  let page = await ensurePage();
-  if (page.isClosed()) {
-    state.page = null;
-    page = await ensurePage();
-  }
-  const alive = await page.evaluate(() => Date.now()).then(() => true).catch(() => false);
-  if (!alive) {
-    // 软恢复：先尝试重新导航到空闲页，避免轻易销毁重建上下文（会丢失登录态）
-    const recovered = await page
-      .goto(toAbsoluteUrl(config.idlePageUrl), { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs })
-      .then(() => true)
-      .catch(() => false);
-    if (!recovered) {
-      await closeBrowser();
-      page = await ensurePage();
-    }
-  }
-  // 续签登录态：每次 keepAlive 都验证登录态有效性，确保登录态真实可用
-  await ensureLoggedIn(page, { verify: true }).catch(() => false);
-  return { success: true, data: await buildStatus() };
-}
-
-async function openPage(urlOrPath, includeHtml = false) {
-  const page = await ensurePage();
-  const startedAt = Date.now();
-  const response = await page.goto(toAbsoluteUrl(urlOrPath), {
-    waitUntil: 'domcontentloaded',
-    timeout: config.navigationTimeoutMs
-  });
-  const data = {
-    url: page.url(),
-    title: await page.title().catch(() => ''),
-    status: response?.status() || 0,
-    ok: response ? response.ok() : true,
-    elapsedMs: Date.now() - startedAt
-  };
-  if (includeHtml && config.maxHtmlChars > 0) {
-    data.html = (await page.content()).slice(0, config.maxHtmlChars);
-  }
-  return { success: true, data };
-}
-
-async function getCookieSnapshot() {
-  const page = await ensurePage();
-  const cookies = await page.context().cookies(config.baseUrl);
-  await persistBrowserState(page.context(), 'cookies');
-  return {
-    success: true,
-    data: {
-      cookieHeader: cookiesToHeader(cookies),
-      cookies: cookies.map((cookie) => ({
-        name: cookie.name,
-        domain: cookie.domain,
-        path: cookie.path,
-        expires: cookie.expires,
-        httpOnly: cookie.httpOnly,
-        secure: cookie.secure,
-        sameSite: cookie.sameSite
-      }))
-    }
-  };
-}
-
-async function loginWithPassword(username, password) {
-  if (!username || !password) {
-    return { success: false, error: 'HDHIVE_USERNAME/HDHIVE_PASSWORD 未配置，或请求体缺少 username/password' };
-  }
-
-  const page = await ensurePage();
-  const startedAt = Date.now();
-  await page.goto(toAbsoluteUrl('/login'), {
-    waitUntil: 'domcontentloaded',
-    timeout: config.navigationTimeoutMs
-  });
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-
-  const loginBlocked = await page.locator('text=出现了很奇怪的错误').count().catch(() => 0);
-  if (loginBlocked > 0) {
-    return {
-      success: false,
-      error: '影巢登录页拒绝当前浏览器环境，请尝试关闭 Headless 或调整浏览器指纹参数',
-      data: await safePageSummary(page, startedAt)
-    };
-  }
-
-  const usernameInput = page.locator('input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"], input[type="text"]').first();
-  const passwordInput = page.locator('input[type="password"], input[name="password"], input[autocomplete="current-password"]').first();
-  // 显式等待登录表单异步渲染出现，容忍 SPA 渲染时机（networkidle 后表单可能尚未挂载，避免误判“未找到表单”）
-  await usernameInput.waitFor({ state: 'visible', timeout: 15000 }).catch(() => undefined);
-  await passwordInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => undefined);
-  if (await usernameInput.count() === 0 || await passwordInput.count() === 0) {
-    const blockedAgain = await page.locator('text=出现了很奇怪的错误').count().catch(() => 0);
-    return {
-      success: false,
-      error: blockedAgain > 0
-        ? '影巢登录页拒绝当前浏览器环境，请尝试关闭 Headless 或调整浏览器指纹参数'
-        : '未找到影巢登录表单，可能需要验证码、二次验证或页面结构已变化',
-      data: await safePageSummary(page, startedAt)
-    };
-  }
-
-  await usernameInput.fill(username, { timeout: config.navigationTimeoutMs });
-  await passwordInput.fill(password, { timeout: config.navigationTimeoutMs });
-  const submitButton = page.locator('button[type="submit"], button:has-text("登录"), [role="button"]:has-text("登录")').first();
-  if (await submitButton.count() > 0) {
-    await submitButton.click({ timeout: config.navigationTimeoutMs });
-  } else {
-    await passwordInput.press('Enter', { timeout: config.navigationTimeoutMs });
-  }
-
-  const loginResult = await waitForLoggedIn(page, startedAt);
-  if (!loginResult.success) {
-    return loginResult;
-  }
-  const statePersisted = await persistBrowserState(page.context(), 'login');
-
-  return {
-    success: true,
-    data: {
-      ...loginResult.data,
-      statePersisted,
-      elapsedMs: Date.now() - startedAt
-    }
-  };
-}
-
-async function waitForLoggedIn(page, startedAt) {
-  const deadline = Date.now() + config.loginTimeoutMs;
-  let lastError = '';
-  while (Date.now() < deadline) {
-    await page.waitForTimeout(1000);
-    const cookies = await page.context().cookies(config.baseUrl);
-    const cookieHeader = cookiesToHeader(cookies);
-    if (cookieHeader && cookies.some((cookie) => ['token', 'csrf_access_token', 'hdh_uid'].includes(cookie.name))) {
-      const current = await customerRequest('/api/customer/user/current', { allowUnsignedResponseFallback: true }).catch((error) => ({
-        success: false,
-        error: error instanceof Error ? error.message : String(error)
-      }));
-      const currentPayload = current.data?.payload || current.data;
-      const currentFailure = getCustomerPayloadFailure(currentPayload);
-      if (current.success && !currentFailure) {
-        return {
-          success: true,
-          data: {
-            cookieHeader,
-            cookieNames: cookies.map((cookie) => cookie.name),
-            currentUser: currentPayload
-          }
-        };
-      }
-      lastError = current.error || currentFailure || '';
-    }
-    const pageText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
-    if (/验证码|二次验证|两步验证|错误|失败|不存在|密码/.test(pageText)) {
-      lastError = pageText.slice(0, 300);
-    }
-  }
-  return {
-    success: false,
-    error: lastError || '登录超时，未获得有效网页登录态',
-    data: await safePageSummary(page, startedAt)
-  };
-}
-
-async function customerRequest(pathname, options = {}) {
-  const page = await ensureRuntimePage();
-  const startedAt = Date.now();
-  const observedResponses = [];
-  const observedResponsePromises = [];
-  const targetPathname = normalizeUrlPathname(pathname);
-  const onResponse = (response) => {
-    let url;
-    try {
-      url = new URL(response.url());
-    } catch {
-      return;
-    }
-    if (url.origin !== config.baseUrl || url.pathname !== targetPathname) {
-      return;
-    }
-    const promise = (async () => {
-      const headers = response.headers();
-      const text = await response.text().catch(() => '');
-      observedResponses.push({
-        url: response.url(),
-        status: response.status(),
-        ok: response.ok(),
-        headers: pickHeaders(headers, ['content-type', 'x-hdh-rsig', 'x-hdh-rts']),
-        body: parseMaybeJson(text)
-      });
-    })();
-    observedResponsePromises.push(promise);
-  };
-  const payload = {
-    path: pathname,
-    method: options.method || 'GET',
-    query: options.query || null,
-    body: options.body === undefined ? null : options.body,
-    timeoutMs: config.customerApiTimeoutMs,
-    targetPathname
-  };
-  page.on('response', onResponse);
-  let result;
-  try {
-    result = await page.evaluate(async (request) => {
-    const getWebpackRequire = () => {
-      let webpackRequire = null;
-      const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-      chunk.push([[`hdhive-bridge-${Date.now()}`], {}, (require) => {
-        webpackRequire = require;
-      }]);
-      return webpackRequire;
-    };
-
-    const findClient = () => {
-      const webpackRequire = getWebpackRequire();
-      if (!webpackRequire) {
-        return null;
-      }
-      const readClient = (exports) => {
-        const axiosClient = exports?.A;
-        if (axiosClient?.get && axiosClient?.post && axiosClient?.interceptors?.request) {
-          return axiosClient;
-        }
-        return null;
-      };
-      const tryRequire = (id) => {
-        try {
-          return readClient(webpackRequire(id));
-        } catch {
-          return null;
-        }
-      };
-      const knownClient = tryRequire(41263);
-      if (knownClient) {
-        return knownClient;
-      }
-      const cache = webpackRequire.c || {};
-      for (const module of Object.values(cache)) {
-        const client = readClient(module?.exports);
-        if (client) {
-          return client;
-        }
-      }
-      const factories = webpackRequire.m || {};
-      for (const [id, factory] of Object.entries(factories)) {
-        const source = String(factory || '');
-        if (!source.includes('X-CSRF-TOKEN') || !source.includes('/api/public/auth/refresh')) {
-          continue;
-        }
-        const client = tryRequire(id);
-        if (client) {
-          return client;
-        }
-      }
-      return null;
-    };
-
-    const client = findClient();
-    if (!client) {
-      throw new Error('未找到影巢签名 API 客户端，请先打开影巢首页完成运行时加载');
-    }
-
-    const query = request.query && typeof request.query === 'object' ? request.query : undefined;
-    const method = String(request.method || 'GET').toUpperCase();
-    const config = query ? { params: query } : undefined;
-    const capturedFetchResponses = [];
-    const parseMaybeJsonInPage = (value) => {
-      if (!value) {
-        return null;
-      }
-      try {
-        return JSON.parse(value);
-      } catch {
-        return value;
-      }
-    };
-    const pickHeaderInPage = (headers, names) => {
-      const picked = {};
-      for (const name of names) {
-        const value = headers?.get?.(name);
-        if (value) {
-          picked[name] = value;
-        }
-      }
-      return picked;
-    };
-    const matchesTargetUrl = (value) => {
-      let url;
-      try {
-        url = new URL(value?.url || value || '', location.origin);
-      } catch {
-        return false;
-      }
-      const target = request.targetPathname || request.path;
-      return url.origin === location.origin && (
-        url.pathname === target
-        || url.pathname === `${target}/`
-        || (
-          String(target).startsWith('/api/customer/resources/')
-          && url.pathname.startsWith('/api/customer/resources/')
-        )
-      );
-    };
-    const originalFetch = window.fetch?.bind(window);
-    if (originalFetch) {
-      window.fetch = async (...args) => {
-        const response = await originalFetch(...args);
-        if (matchesTargetUrl(response.url || args[0])) {
-          const text = await response.clone().text().catch(() => '');
-          capturedFetchResponses.push({
-            url: response.url || String(args[0] || ''),
-            status: response.status,
-            ok: response.ok,
-            headers: pickHeaderInPage(response.headers, ['content-type', 'x-hdh-rsig', 'x-hdh-rts']),
-            body: parseMaybeJsonInPage(text)
-          });
-        }
-        return response;
-      };
-    }
-    const call = (async () => {
-      try {
-        const response = method === 'GET'
-          ? await client.get(request.path, config)
-          : await client.post(request.path, request.body ?? undefined, config);
-        if (response?.error) {
-          return { ok: false, payload: response.error };
-        }
-        return { ok: true, payload: response?.response ?? response };
-      } catch (error) {
-        return {
-          ok: false,
-          payload: {
-            name: error?.name || '',
-            code: error?.code || '',
-            httpStatus: error?.httpStatus || error?.status || 0,
-            message: error?.message || error?.description || String(error),
-            responseStatus: error?.response?.status || 0,
-            responseData: error?.response?.data ?? null
-          }
-        };
-      }
-    })();
-    const timeoutMs = Number(request.timeoutMs || 30_000);
-    const timeout = new Promise((resolve) => {
-      setTimeout(() => resolve({
-        ok: false,
-        payload: {
-          name: 'TimeoutError',
-          code: 'customer_api_timeout',
-          httpStatus: 0,
-          message: `影巢 customer API 调用超时: ${timeoutMs}ms`
-        }
-      }), timeoutMs);
-    });
-      try {
-        const callResult = await Promise.race([call, timeout]);
-        return { ...callResult, capturedFetchResponses };
-      } finally {
-        if (originalFetch) {
-          window.fetch = originalFetch;
-        }
-      }
-    }, payload);
-    await Promise.race([
-      Promise.allSettled(observedResponsePromises),
-      delay(1000)
-    ]);
-  } finally {
-    page.off('response', onResponse);
-  }
-
-  const allObservedResponses = [
-    ...observedResponses,
-    ...(Array.isArray(result.capturedFetchResponses) ? result.capturedFetchResponses : [])
-  ];
-  const observedResponse = allObservedResponses[allObservedResponses.length - 1] || null;
-  const responseSignatureMissing = isMissingResponseSignaturePayload(result.payload);
-  const responseDataFallback = result.payload?.responseData !== undefined && result.payload?.responseData !== null
-    ? {
-        status: result.payload.responseStatus || 0,
-        ok: !result.payload.responseStatus || Number(result.payload.responseStatus) < 400,
-        headers: {},
-        body: result.payload.responseData
-      }
-    : null;
-  const fallbackResponse = observedResponse || responseDataFallback;
-  const unsignedResponseFallback = Boolean(
-    options.allowUnsignedResponseFallback
-    && !result.ok
-    && responseSignatureMissing
-    && fallbackResponse?.ok
-    && fallbackResponse.body !== undefined
-  );
-  if (unsignedResponseFallback) {
-    const fallbackPayload = fallbackResponse.body ?? { success: true, message: '影巢请求已完成但响应体为空' };
-    const fallbackFailure = getCustomerPayloadFailure(fallbackPayload);
-    result = {
-      ok: !fallbackFailure,
-      payload: fallbackPayload,
-      warning: fallbackFailure
-        ? '影巢响应缺少 X-HDH-RSig，且同源网络响应为业务失败状态'
-        : '影巢响应缺少 X-HDH-RSig，已使用 Bridge 捕获到的同源网络响应正文'
-    };
-  }
-
-  const payloadFailure = getCustomerPayloadFailure(result.payload);
-  const requestSucceeded = Boolean(result.ok && !payloadFailure);
-  const statePersisted = requestSucceeded ? await persistBrowserState(page.context(), `customer:${pathname}`) : false;
-  return {
-    success: requestSucceeded,
-    data: {
-      path: pathname,
-      method: payload.method,
-      payload: result.payload,
-      statePersisted,
-      responseSignatureMissing,
-      unsignedResponseFallback,
-      observedResponse: observedResponse ? {
-        status: observedResponse.status,
-        ok: observedResponse.ok,
-        hasResponseSignature: Boolean(observedResponse.headers?.['x-hdh-rsig'])
-      } : null,
-      elapsedMs: Date.now() - startedAt
-    },
-    ...(result.warning ? { warning: result.warning } : {}),
-    ...(requestSucceeded ? {} : { error: payloadFailure || result.payload?.message || result.payload?.description || '影巢 customer API 调用失败' })
-  };
-}
-
-async function ensureRuntimePage() {
-  const page = await ensurePage();
-  if (!page.url().startsWith(config.baseUrl)) {
-    await page.goto(toAbsoluteUrl(config.idlePageUrl), {
-      waitUntil: 'domcontentloaded',
-      timeout: config.navigationTimeoutMs
-    });
-  }
-  await page.waitForFunction(() => {
-    const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-    let found = false;
-    chunk.push([[`hdhive-bridge-probe-${Date.now()}`], {}, (require) => {
-      const hasClient = (exports) => {
-        const axiosClient = exports?.A;
-        return Boolean(axiosClient?.get && axiosClient?.post && axiosClient?.interceptors?.request);
-      };
-      const tryRequire = (id) => {
-        try {
-          return hasClient(require(id));
-        } catch {
-          return false;
-        }
-      };
-      found = tryRequire(41263);
-      if (found) {
-        return;
-      }
-      const cache = require?.c || {};
-      found = Object.values(cache).some((module) => hasClient(module?.exports));
-      if (found) {
-        return;
-      }
-      const factories = require?.m || {};
-      for (const [id, factory] of Object.entries(factories)) {
-        const source = String(factory || '');
-        if (source.includes('X-CSRF-TOKEN') && source.includes('/api/public/auth/refresh') && tryRequire(id)) {
-          found = true;
-          return;
-        }
-      }
-    }]);
-    return found;
-  }, { timeout: config.customerApiTimeoutMs });
-  return page;
-}
-
-async function getResourceDetail(resourceId) {
-  const resourcePath = `/resource/189/${encodeURIComponent(resourceId)}`;
-  const apiResult = await customerRequest(`/api/customer/resources/${resourceId}`, {
-    allowUnsignedResponseFallback: true
-  }).catch((error) => ({
-    success: false,
-    error: error instanceof Error ? error.message : String(error)
-  }));
-  const pageResult = await readResourcePage(resourceId, resourcePath).catch((error) => ({
-    success: false,
-    error: error instanceof Error ? error.message : String(error)
-  }));
-  const payloadResources = extractResourceCandidates(apiResult.data?.payload || apiResult.data);
-  const resources = mergeResources([
-    ...payloadResources,
-    ...(pageResult.data?.resources || [])
-  ]);
-  const payload = {
-    success: true,
-    data: resources,
-    message: resources.length ? 'success' : '未解析到资源详情',
-    code: '200'
-  };
-  return {
-    success: apiResult.success || pageResult.success,
-    data: {
-      resourcePath,
-      payload,
-      resources,
-      api: apiResult,
-      page: pageResult.success ? pageResult.data : null,
-      source: 'resource-detail'
-    },
-    ...(apiResult.success || pageResult.success ? {} : {
-      error: apiResult.error || pageResult.error || '影巢资源详情读取失败'
-    })
-  };
-}
-
-async function unlockResource(resourceId, body) {
-  const unlockResult = await customerRequest(`/api/customer/resources/${resourceId}/unlock`, {
-    method: 'POST',
-    body,
-    allowUnsignedResponseFallback: true
-  });
-  if (!unlockResult.success) {
-    return unlockResult;
-  }
-  const detailResult = await getResourceDetail(resourceId).catch((error) => ({
-    success: false,
-    error: error instanceof Error ? error.message : String(error)
-  }));
-  const unlockPayload = unlockResult.data?.payload || unlockResult.data;
-  const resources = mergeResources([
-    ...extractResourceCandidates(unlockPayload),
-    ...(detailResult.data?.resources || [])
-  ]);
-  return {
-    success: true,
-    data: {
-      ...unlockResult.data,
-      payload: unlockPayload,
-      resources,
-      detail: detailResult.success ? detailResult.data : null,
-      source: 'resource-unlock'
-    },
-    ...(detailResult.success ? {} : { warning: detailResult.error || '解锁成功，但详情页回读失败' })
-  };
-}
-
-async function readResourcePage(resourceId, resourcePath, retry = 0) {
-  const page = await ensurePage();
-  const startedAt = Date.now();
-  const response = await page.goto(toAbsoluteUrl(resourcePath), {
-    waitUntil: 'domcontentloaded',
-    timeout: config.navigationTimeoutMs
-  });
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-  await dismissKnownNotice(page);
-
-  const pageText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
-  if (/出现了很奇怪的错误/.test(pageText)) {
-    return {
-      success: false,
-      error: '影巢资源页拒绝当前浏览器环境，请重启 Bridge 或尝试关闭 Headless',
-      data: await safePageSummary(page, startedAt)
-    };
-  }
-
-  // 登录失效自动恢复
-  if (/\/login(?:\?|$)/i.test(page.url())) {
-    if (retry >= 1) {
-      return {
-        success: false,
-        error: '影巢登录态已失效，自动重新登录后仍然失败',
-        data: await safePageSummary(page, startedAt)
-      };
-    }
-    console.warn('[browser-bridge] 资源详情页检测到登录态失效，尝试自动重新登录...');
-    const loginSuccess = await ensureLoggedIn(page);
-    if (!loginSuccess) {
-      return {
-        success: false,
-        error: '影巢登录态已失效，自动重新登录失败',
-        data: await safePageSummary(page, startedAt)
-      };
-    }
-    console.log('[browser-bridge] 自动重新登录成功，重试资源详情查询...');
-    return readResourcePage(resourceId, resourcePath, retry + 1);
-  }
-
-  const domResource = await scrapeCurrentCloud189Resource(page, resourceId);
-  const html = await page.content();
-  const htmlResources = extractResourceEntriesFromHtml(html, page.url());
-  const resources = mergeResources([
-    ...(domResource ? [domResource] : []),
-    ...htmlResources
-  ]);
-  const statePersisted = await persistBrowserState(page.context(), `resource-detail:${resourceId}`);
-  return {
-    success: true,
-    data: {
-      pageUrl: page.url(),
-      status: response?.status() || 0,
-      ok: response ? response.ok() : true,
-      resources,
-      statePersisted,
-      elapsedMs: Date.now() - startedAt
-    }
-  };
-}
-
-async function getMediaResources(type, tmdbId, retry = 0) {
-  if (!['movie', 'tv'].includes(type) || !tmdbId) {
-    return { success: false, error: 'type 必须是 movie/tv，tmdbId 不能为空' };
-  }
-  const startedAt = Date.now();
-  const timings = { start: startedAt }; // 记录各步骤耗时
-  const page = await ensurePage();
-  timings.ensurePage = Date.now() - startedAt;
-
-  const mediaPath = `/tmdb/${type}/${encodeURIComponent(tmdbId)}`;
-  const capturedTargets = [];
-  const observedCustomerRequests = [];
-  const capturedResponses = [];
-  const nextDataCaptures = []; // 捕获 Next.js 页面数据
-
-  const onRequest = (request) => {
-    try {
-      const url = new URL(request.url());
-      if (!url.pathname.startsWith('/api/customer/')) {
-        return;
-      }
-      const query = Object.fromEntries(url.searchParams.entries());
-      observedCustomerRequests.push({
-        pathname: url.pathname,
-        method: request.method(),
-        query,
-        postData: parseMaybeJson(request.postData())
-      });
-      if (url.pathname === '/api/customer/subscriptions/check') {
-        const targetType = query.target_type || '';
-        const targetKey = query.target_key || '';
-        if (targetType && targetKey) {
-          capturedTargets.push({ target_type: targetType, target_key: targetKey });
-        }
-      }
-    } catch {
-      // Ignore observer errors; resource scraping below still runs.
-    }
-  };
-
-  const onResponse = async (response) => {
-    try {
-      const url = new URL(response.url());
-
-      // 拦截 Next.js 的页面数据请求
-      if (url.pathname.startsWith('/_next/data/') && url.pathname.includes(`/tmdb/${type}/`)) {
-        const text = await response.text().catch(() => '');
-        try {
-          const data = JSON.parse(text);
-          console.log('[browser-bridge] 🎯 捕获到 Next.js 页面数据！');
-          nextDataCaptures.push({
-            url: response.url(),
-            data,
-            capturedAt: Date.now()
-          });
-        } catch {
-          // JSON 解析失败，忽略
-        }
-      }
-
-      if (!url.pathname.startsWith('/api/customer/')) {
-        return;
-      }
-      const request = response.request();
-      const contentType = response.headers()['content-type'] || '';
-      let body = null;
-      if (contentType.includes('application/json')) {
-        body = await response.json().catch(() => null);
-      } else {
-        body = await response.text().catch(() => '');
-      }
-      capturedResponses.push({
-        url: response.url(),
-        status: response.status(),
-        ok: response.ok(),
-        request: {
-          method: request.method(),
-          postData: parseMaybeJson(request.postData()),
-          headers: pickHeaders(request.headers(), ['content-type'])
-        },
-        body
-      });
-    } catch {
-      // Ignore observer errors; manual fallback below still runs.
-    }
-  };
-  page.on('request', onRequest);
-  page.on('response', onResponse);
-  try {
-    console.log(`[browser-bridge] 查询资源: ${mediaPath}`);
-
-    // 检查是否已经在目标页面，避免不必要的重新导航
-    const currentUrl = page.url();
-    const targetUrl = toAbsoluteUrl(mediaPath);
-
-    // 更宽松的判断：只要URL包含movie ID就认为在目标页面
-    const movieIdMatch = mediaPath.match(/\/movie\/(\w+)/);
-    const tmdbIdMatch = mediaPath.match(/\/tmdb\/movie\/(\d+)/);
-    const isOnTargetPage = movieIdMatch ? currentUrl.includes(movieIdMatch[1]) :
-                           tmdbIdMatch ? currentUrl.includes(`/movie/`) && !currentUrl.includes('/login') :
-                           currentUrl === targetUrl;
-
-    console.log(`[browser-bridge] 当前URL: ${currentUrl}, 目标: ${targetUrl}, 在目标页: ${isOnTargetPage}`);
-
-    if (!isOnTargetPage) {
-      console.log(`[browser-bridge] 导航到页面: ${targetUrl}`);
-      const navStart = Date.now();
-      try {
-        await page.goto(targetUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: config.navigationTimeoutMs
-        });
-      } catch (error) {
-        // 如果导航被中止，可能是因为反爬检测或重定向，检查当前 URL
-        const currentUrl = page.url();
-        console.warn(`[browser-bridge] 导航异常: ${error instanceof Error ? error.message : String(error)}, 当前URL: ${currentUrl}`);
-
-        // 如果跳转到了登录页，说明登录态失效
-        if (/\/login(?:\?|$)/i.test(currentUrl)) {
-          throw error; // 让后面的登录检测逻辑处理
-        }
-
-        // 如果已经在目标类型的页面（movie/tv），即使 URL 不完全匹配也继续
-        if (currentUrl.includes(`/${type}/`) || currentUrl.includes(`/tmdb/${type}/`)) {
-          console.log(`[browser-bridge] 导航被中止但已到达相关页面，继续执行`);
-        } else {
-          throw error; // 其他情况抛出错误
-        }
-      }
-      timings.navigation = Date.now() - navStart;
-
-      const waitStart = Date.now();
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-      timings.networkIdle = Date.now() - waitStart;
-    } else {
-      console.log(`[browser-bridge] 已在目标页面，跳过导航`);
-      timings.navigation = 0;
-      // 虽然不导航，但等待一下确保页面稳定
-      await page.waitForTimeout(500);
-      timings.networkIdle = 500;
-    }
-
-    await dismissKnownNotice(page);
-
-    const pageText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
-    if (/出现了很奇怪的错误/.test(pageText)) {
-      return {
-        success: false,
-        error: '影巢详情页拒绝当前浏览器环境，请重启 Bridge 或尝试关闭 Headless',
-        data: await safePageSummary(page, startedAt)
-      };
-    }
-
-    // 登录失效自动恢复
-    if (/\/login(?:\?|$)/i.test(page.url())) {
-      if (retry >= 1) {
-        return {
-          success: false,
-          error: '影巢登录态已失效，自动重新登录后仍然失败',
-          data: await safePageSummary(page, startedAt)
-        };
-      }
-      console.warn('[browser-bridge] 检测到登录态失效，尝试自动重新登录...');
-      const loginSuccess = await ensureLoggedIn(page);
-      if (!loginSuccess) {
-        return {
-          success: false,
-          error: '影巢登录态已失效，自动重新登录失败',
-          data: await safePageSummary(page, startedAt)
-        };
-      }
-      console.log('[browser-bridge] 自动重新登录成功，重试资源查询...');
-      page.off('request', onRequest);
-      page.off('response', onResponse);
-      return getMediaResources(type, tmdbId, retry + 1);
-    }
-
-    // 优化后的滚动策略 - 减少等待时间
-    console.log('[browser-bridge] 智能加载资源...');
-    const scrollStart = Date.now();
-
-    // 快速初始滚动 - 只等待 1.5 秒让关键内容加载
-    await page.waitForTimeout(1500);
-
-    let foundResources = false;
-    // 减少滚动次数：从 10 次降到 6 次
-    for (let i = 0; i < 6; i++) {
-      const scrollAmount = 600 + Math.random() * 200;
-      await page.mouse.wheel(0, scrollAmount);
-
-      // 减少等待时间：从 400-700ms 降到 200-400ms
-      const waitTime = 200 + Math.random() * 200;
-      await page.waitForTimeout(waitTime);
-
-      // 每 2 次检测一次
-      if (i % 2 === 1) {
-        const quickCheck = await page.locator('a[href*="/resource/189/"]').count().catch(() => 0);
-        if (quickCheck > 0) {
-          console.log(`[browser-bridge] 滚动 ${i + 1} 次后检测到 ${quickCheck} 个资源链接`);
-          foundResources = true;
-          break;
-        }
-      }
-    }
-    timings.initialScroll = Date.now() - scrollStart;
-
-    // 尝试点击天翼云盘标签
-    const tabStart = Date.now();
-    const clickedCloud189Tab = await clickCloud189Tab(page);
-    timings.clickTab = Date.now() - tabStart;
-
-    if (clickedCloud189Tab) {
-      console.log('[browser-bridge] 成功点击天翼云盘标签');
-      // 点击后等待 2 秒（从 3 秒优化到 2 秒）
-      await page.waitForTimeout(2000);
-
-      // 再次滚动，减少次数：从 8 次降到 5 次
-      const scrollAfterTabStart = Date.now();
-      for (let i = 0; i < 5; i++) {
-        const scrollAmount = 500 + Math.random() * 200;
-        await page.mouse.wheel(0, scrollAmount);
-
-        const waitTime = 250 + Math.random() * 150;
-        await page.waitForTimeout(waitTime);
-
-        // 检测资源
-        if (i % 2 === 1) {
-          const count = await page.locator('a[href*="/resource/189/"]').count().catch(() => 0);
-          if (count > 0) {
-            console.log(`[browser-bridge] 点击标签后滚动 ${i + 1} 次，检测到 ${count} 个资源链接`);
-            if (count >= 3) break; // 找到足够的资源就停止
-          }
-        }
-      }
-      timings.scrollAfterTab = Date.now() - scrollAfterTabStart;
-    } else if (!foundResources) {
-      console.warn('[browser-bridge] 未找到天翼云盘标签，尝试继续提取资源');
-      // 没找到标签，再滚动一些（从 6 次降到 4 次）
-      for (let i = 0; i < 4; i++) {
-        await page.mouse.wheel(0, 600);
-        await page.waitForTimeout(400);
-      }
-      timings.scrollAfterTab = 1600;
-    }
-
-    // 最后等待，从 1.5 秒优化到 1 秒
-    await page.waitForTimeout(1000);
-
-    const extractStart = Date.now();
-    const html = await page.content();
-    const target = extractMediaResourceTarget(html, type, tmdbId, capturedTargets);
-
-    // 尝试从 __NEXT_DATA__ 中提取资源（最快最可靠）
-    const nextDataResources = await extractResourcesFromNextData(page);
-    console.log(`[browser-bridge] 🎯 Next.js数据提取: ${nextDataResources.length} 个资源`);
-
-    // 尝试从捕获的 Next.js 页面数据中提取
-    const capturedNextResources = extractResourcesFromNextDataCaptures(nextDataCaptures);
-    console.log(`[browser-bridge] 📡 拦截数据提取: ${capturedNextResources.length} 个资源`);
-
-    // 传统 DOM 和 HTML 提取作为兜底
-    const domResources = await scrapeCloud189Resources(page);
-    const htmlResources = extractResourceEntriesFromHtml(html, page.url());
-
-    // 合并所有来源的资源，优先使用 API 数据
-    const resources = mergeResources([
-      ...nextDataResources,
-      ...capturedNextResources,
-      ...domResources,
-      ...htmlResources
-    ]);
-    timings.extract = Date.now() - extractStart;
-
-    console.log(`[browser-bridge] 资源提取汇总: Next.js数据${nextDataResources.length}个, 拦截${capturedNextResources.length}个, DOM${domResources.length}个, HTML${htmlResources.length}个, 合并后${resources.length}个`);
-
-    // 如果提取到0个资源且是第一次尝试，等待后重试提取（优化等待时间）
-    if (resources.length === 0 && retry === 0) {
-      console.warn('[browser-bridge] 第一次提取到0个资源，等待3秒后重试提取...');
-      await page.waitForTimeout(3000); // 从 5 秒降到 3 秒
-
-      // 再次滚动（减少次数）
-      for (let i = 0; i < 3; i++) {
-        await page.mouse.wheel(0, 700);
-        await page.waitForTimeout(500);
-      }
-
-      // 重新提取
-      const retryExtractStart = Date.now();
-      const html2 = await page.content();
-      const domResources2 = await scrapeCloud189Resources(page);
-      const htmlResources2 = extractResourceEntriesFromHtml(html2, page.url());
-      const resources2 = mergeResources([...domResources2, ...htmlResources2]);
-      timings.retryExtract = Date.now() - retryExtractStart;
-
-      if (resources2.length > 0) {
-        console.log(`[browser-bridge] 重试提取成功！找到 ${resources2.length} 个资源`);
-        const statePersisted = await persistBrowserState(page.context(), 'media-resources');
-
-        timings.total = Date.now() - startedAt;
-        console.log(`[browser-bridge] DOM提取: ${domResources2.length} 个, HTML提取: ${htmlResources2.length} 个, 合并后: ${resources2.length} 个资源，总耗时 ${timings.total}ms`);
-        console.log(`[browser-bridge] 耗时分解: 准备${timings.ensurePage}ms, 导航${timings.navigation}ms, 网络${timings.networkIdle}ms, 滚动${timings.initialScroll}ms, 点击标签${timings.clickTab}ms, 标签后滚动${timings.scrollAfterTab}ms, 提取${timings.extract}ms, 重试提取${timings.retryExtract}ms`);
-
-        const payload = {
-          success: true,
-          data: resources2,
-          message: resources2.length ? 'success' : '未找到天翼云盘资源',
-          code: '200'
-        };
-        return {
-          success: true,
-          data: {
-            mediaPath,
-            pageUrl: page.url(),
-            target,
-            payload,
-            resources: resources2,
-            captured: true,
-            source: 'page-rendered-resources',
-            statePersisted,
-            clickedCloud189Tab,
-            observedCustomerRequests: observedCustomerRequests.slice(-20),
-            elapsedMs: timings.total,
-            timings,
-            retried: true
-          }
-        };
-      }
-      console.warn('[browser-bridge] 重试提取仍然是0个资源');
-    }
-
-    const statePersisted = await persistBrowserState(page.context(), 'media-resources');
-    timings.total = Date.now() - startedAt;
-
-    console.log(`[browser-bridge] DOM提取: ${domResources.length} 个, HTML提取: ${htmlResources.length} 个, 合并后: ${resources.length} 个资源，总耗时 ${timings.total}ms`);
-    console.log(`[browser-bridge] 耗时分解: 准备${timings.ensurePage}ms, 导航${timings.navigation}ms, 网络${timings.networkIdle}ms, 滚动${timings.initialScroll}ms, 点击标签${timings.clickTab}ms, 标签后滚动${timings.scrollAfterTab || 0}ms, 提取${timings.extract}ms`);
-
-    const payload = {
-      success: true,
-      data: resources,
-      message: resources.length ? 'success' : '未找到天翼云盘资源',
-      code: '200'
-    };
-    return {
-      success: true,
-      data: {
-        mediaPath,
-        pageUrl: page.url(),
-        target,
-        payload,
-        resources,
-        captured: true,
-        source: 'page-rendered-resources',
-        statePersisted,
-        clickedCloud189Tab,
-        observedCustomerRequests: observedCustomerRequests.slice(-20),
-        capturedResponses: capturedResponses.slice(-20),
-        elapsedMs: timings.total,
-        timings
-      }
-    };
-  } finally {
-    page.off('request', onRequest);
-    page.off('response', onResponse);
-  }
-}
-
-async function dismissKnownNotice(page) {
-  await page.getByText(/我知道了/).click({ timeout: 2000 }).catch(() => undefined);
-}
-
-async function scrollPage(page, times, deltaY, waitMs) {
-  for (let index = 0; index < times; index += 1) {
-    await page.mouse.wheel(0, deltaY);
-    await page.waitForTimeout(waitMs);
-  }
-}
-
-async function clickCloud189Tab(page) {
-  // 优化：减少等待时间和尝试次数
-  await page.waitForTimeout(800); // 从 1500ms 降到 800ms
-
-  for (let index = 0; index < 10; index += 1) { // 从 15 次降到 10 次
-    const clicked = await page.evaluate(() => {
-      const isVisible = (node) => {
-        const rect = node.getBoundingClientRect();
-        const style = window.getComputedStyle(node);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-      };
-      const textOf = (node) => (node.innerText || node.textContent || '').trim();
-      const candidates = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],a,div[class*="tab"],span[class*="tab"]'));
-      const exact = candidates.find((node) => isVisible(node) && /天翼云盘/.test(textOf(node)));
-      const fallback = candidates.find((node) => isVisible(node) && (/\b189\b/.test(textOf(node)) || /天翼/.test(textOf(node))));
-      const target = exact || fallback;
-      if (!target) {
-        return false;
-      }
-      target.scrollIntoView({ block: 'center', inline: 'center' });
-      target.click();
-      return true;
-    }).catch(() => false);
-    if (clicked) {
-      console.log(`[browser-bridge] 第 ${index + 1} 次尝试成功点击天翼云盘标签`);
-      return true;
-    }
-    // 优化：前 3 次快速重试，后续适度滚动
-    if (index < 3) {
-      await page.waitForTimeout(500); // 从 800ms 降到 500ms
-    } else {
-      await page.mouse.wheel(0, 400); // 从 500 降到 400
-      await page.waitForTimeout(400); // 从 500ms 降到 400ms
-    }
-  }
-  console.warn('[browser-bridge] 尝试 10 次后仍未找到天翼云盘标签');
-  return false;
-}
-
-async function scrapeCloud189Resources(page) {
-  return await page.evaluate(() => {
-    const parseSize = (value) => {
-      const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)/i);
-      if (!match) {
-        return 0;
-      }
-      const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
-      return Math.round(Number(match[1]) * units[match[2].toUpperCase()]);
-    };
-    const parseTitle = (lines) => {
-      const pointsIndex = lines.findIndex((line) => /免费|\d+\s*积分/.test(line));
-      const startIndex = pointsIndex >= 0 ? pointsIndex + 1 : 0;
-      const skipPattern = /^(发布于|免费|\d+\s*积分|疑似失效|加入片单|4K|1080P|720P|简中|简英双语|内封|外挂|WEB-DL\/WEBRip|蓝光原盘\/REMUX|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B))$/i;
-      const title = lines.slice(startIndex).find((line) => line.length > 3 && !skipPattern.test(line));
-      return title || lines[0] || '影巢天翼资源';
-    };
-    const resourceSlugFromAnchor = (anchor) => {
-      try {
-        const href = new URL(anchor.href, location.href);
-        const parts = href.pathname.split('/').filter(Boolean);
-        return decodeURIComponent(parts[2] || '');
-      } catch {
-        return '';
-      }
-    };
-    const resourceSlugsIn = (node) => [...new Set(Array.from(node.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'))
-      .map(resourceSlugFromAnchor)
-      .filter(Boolean))];
-    const findResourceCard = (anchor, slug) => {
-      let card = anchor;
-      let best = anchor;
-      for (let index = 0; index < 8 && card?.parentElement; index += 1) {
-        const parent = card.parentElement;
-        const slugs = resourceSlugsIn(parent);
-        if (slugs.length > 1 || (slugs.length === 1 && slugs[0] !== slug)) {
-          break;
-        }
-        const text = (parent.innerText || '').trim();
-        if (/发布于|积分|免费|疑似失效|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B)/i.test(text)) {
-          best = parent;
-        }
-        card = parent;
-      }
-      return best;
-    };
-    const parseResource = (anchor) => {
-      const href = new URL(anchor.href, location.href);
-      const parts = href.pathname.split('/').filter(Boolean);
-      const slug = decodeURIComponent(parts[2] || '');
-      if (!slug) {
-        return null;
-      }
-      const card = findResourceCard(anchor, slug);
-      const text = (card?.innerText || anchor.innerText || anchor.textContent || '').trim();
-      const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
-      const pointsMatch = text.match(/(\d+)\s*积分/);
-      const isFree = /(^|\n|\s)免费($|\n|\s)/.test(text);
-      const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
-      return {
-        id: slug,
-        slug,
-        title: parseTitle(lines),
-        pan_type: '189',
-        share_size: parseSize(text),
-        unlock_points: pointsMatch ? Number(pointsMatch[1]) : 0,
-        is_free: isFree,
-        expired: /疑似失效/.test(text),
-        is_unlocked: /已解锁|查看链接|复制链接/.test(text) || Boolean(cloudLink),
-        media_url: cloudLink?.[0] || '',
-        pageUrl: href.href,
-        user: lines[0] ? { name: lines[0] } : {},
-        publishedAt: (text.match(/发布于\s*([0-9/-]+)/) || [])[1] || '',
-        source: 'dom'
-      };
-    };
-    const anchors = Array.from(document.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'));
-    // 返回调试信息
-    console.log('[DOM] Found', anchors.length, 'resource anchors');
-    return anchors.map(parseResource).filter(Boolean);
-  }).catch(() => []);
-}
-
-async function scrapeCurrentCloud189Resource(page, resourceId) {
-  return await page.evaluate((slug) => {
-    const text = (document.body?.innerText || '').trim();
-    const parseSize = (value) => {
-      const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)/i);
-      if (!match) {
-        return 0;
-      }
-      const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
-      return Math.round(Number(match[1]) * units[match[2].toUpperCase()]);
-    };
-    const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    const title = lines.find((line) => line.length > 3 && !/^(发布于|免费|\d+\s*积分|疑似失效|查看链接|复制链接|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B))$/i.test(line))
-      || document.title
-      || '影巢天翼资源';
-    const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
-    const accessCode = (text.match(/(?:访问码|提取码)[：:\s]*([A-Za-z0-9]{4})/) || [])[1] || '';
-    const pointsMatch = text.match(/(\d+)\s*积分/);
-    return {
-      id: slug,
-      slug,
-      title,
-      pan_type: '189',
-      share_size: parseSize(text),
-      unlock_points: pointsMatch ? Number(pointsMatch[1]) : 0,
-      expired: /疑似失效/.test(text),
-      is_unlocked: /已解锁|查看链接|复制链接/.test(text) || Boolean(cloudLink),
-      media_url: cloudLink?.[0] || '',
-      access_code: accessCode,
-      pageUrl: location.href,
-      source: 'resource-page'
-    };
-  }, resourceId).catch(() => null);
-}
-
-async function extractResourcesFromNextData(page) {
-  return await page.evaluate(() => {
-    try {
-      // 从 __NEXT_DATA__ script 标签中提取数据
-      const nextDataScript = document.getElementById('__NEXT_DATA__');
-      if (!nextDataScript || !nextDataScript.textContent) {
-        return [];
-      }
-
-      const nextData = JSON.parse(nextDataScript.textContent);
-      const pageProps = nextData?.props?.pageProps;
-      if (!pageProps) {
-        return [];
-      }
-
-      // 查找可能包含资源的字段
-      const resources = [];
-      const searchForResources = (obj, depth = 0) => {
-        if (depth > 10 || !obj || typeof obj !== 'object') {
-          return;
-        }
-
-        // 查找资源数组
-        if (Array.isArray(obj)) {
-          for (const item of obj) {
-            if (item && typeof item === 'object') {
-              // 检查是否是资源对象
-              if ((item.slug || item.id || item.resource_id) &&
-                  (item.pan_type === '189' || item.netdisk_website_id === '189' || item.website_id === '189')) {
-                resources.push({
-                  ...item,
-                  source: 'nextjs-data'
-                });
-              } else {
-                searchForResources(item, depth + 1);
-              }
-            }
-          }
-        } else {
-          for (const value of Object.values(obj)) {
-            searchForResources(value, depth + 1);
-          }
-        }
-      };
-
-      searchForResources(pageProps);
-      console.log('[Next.js Data] Found', resources.length, 'resources');
-      return resources;
-    } catch (error) {
-      console.error('[Next.js Data] Error:', error);
-      return [];
-    }
-  }).catch(() => []);
-}
-
-function extractResourcesFromNextDataCaptures(captures) {
-  const resources = [];
-
-  for (const capture of captures) {
-    try {
-      const pageProps = capture.data?.pageProps;
-      if (!pageProps) {
-        continue;
-      }
-
-      // 递归搜索资源
-      const searchForResources = (obj, depth = 0) => {
-        if (depth > 10 || !obj || typeof obj !== 'object') {
-          return;
-        }
-
-        if (Array.isArray(obj)) {
-          for (const item of obj) {
-            if (item && typeof item === 'object') {
-              if ((item.slug || item.id || item.resource_id) &&
-                  (item.pan_type === '189' || item.netdisk_website_id === '189' || item.website_id === '189')) {
-                resources.push({
-                  ...item,
-                  source: 'nextjs-capture'
-                });
-              } else {
-                searchForResources(item, depth + 1);
-              }
-            }
-          }
-        } else {
-          for (const value of Object.values(obj)) {
-            searchForResources(value, depth + 1);
-          }
-        }
-      };
-
-      searchForResources(pageProps);
-    } catch (error) {
-      console.error('[Next.js Capture] Error:', error);
-    }
-  }
-
-  return resources;
-}
-
-
-async function getStateDbPool() {
-  if (!config.stateDatabaseUrl) {
-    return null;
-  }
-  if (state.stateDbPool) {
-    return state.stateDbPool;
-  }
-  const { Pool } = await import('pg');
-  state.stateDbPool = new Pool({
-    connectionString: normalizeStateDatabaseUrl(config.stateDatabaseUrl),
-    ssl: resolveStateDatabaseSsl(config.stateDatabaseUrl, config.stateDatabaseSsl),
-    max: 2,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 10_000
-  });
-  return state.stateDbPool;
-}
-
-async function ensureStateTable() {
-  const pool = await getStateDbPool();
-  if (!pool || state.stateDbInitialized) {
-    return pool;
-  }
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS browser_bridge_state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  state.stateDbInitialized = true;
-  return pool;
-}
-
-async function restoreBrowserState(context) {
-  // 优先从数据库恢复
-  if (config.stateDatabaseUrl) {
-    try {
-      const pool = await ensureStateTable();
-      const result = await pool.query('SELECT value, updated_at FROM browser_bridge_state WHERE key = $1', [config.stateKey]);
-      const rawValue = result.rows[0]?.value;
-      if (rawValue) {
-        const snapshot = decodeStateValue(rawValue);
-        const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
-        if (cookies.length > 0) {
-          await context.addCookies(cookies);
-          console.log(`[browser-bridge] 从数据库恢复 ${cookies.length} 个 Cookie`);
-        }
-        const origins = Array.isArray(snapshot?.origins) ? snapshot.origins : [];
-        if (origins.length > 0) {
-          await context.addInitScript((storedOrigins) => {
-            const matched = storedOrigins.find((origin) => origin.origin === window.location.origin);
-            if (!matched?.localStorage) {
-              return;
-            }
-            for (const item of matched.localStorage) {
-              try {
-                window.localStorage.setItem(item.name, item.value);
-              } catch {
-                // ignore
-              }
-            }
-          }, origins);
-        }
-        state.stateLoadOk = true;
-        state.stateLoadedAt = Date.now();
-        state.stateLastError = '';
-        return true;
-      }
-    } catch (error) {
-      state.stateLoadOk = false;
-      state.stateLastError = `restore from db: ${error instanceof Error ? error.message : String(error)}`;
-      console.warn('[browser-bridge] 从数据库恢复状态失败，尝试本地文件:', state.stateLastError);
-    }
-  }
-
-  // 从本地文件恢复（兜底方案）
-  try {
-    const fs = await import('node:fs/promises');
-    const path = await import('node:path');
-    const stateFile = path.join(config.profileDir, 'browser-state.json');
-    const fileContent = await fs.readFile(stateFile, 'utf-8');
-    const snapshot = JSON.parse(fileContent);
-    const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
-    if (cookies.length > 0) {
-      // 调试：检查恢复的 Cookie 是否有值
-      const tokenCookie = cookies.find(c => c.name === 'token');
-      if (tokenCookie) {
-        console.log(`[browser-bridge] 恢复的 token Cookie 值长度: ${tokenCookie.value?.length || 0}`);
-      }
-      await context.addCookies(cookies);
-      console.log(`[browser-bridge] 从本地文件恢复 ${cookies.length} 个 Cookie`);
-
-      // 验证恢复后的 Cookie
-      const actualCookies = await context.cookies();
-      const actualToken = actualCookies.find(c => c.name === 'token');
-      if (actualToken) {
-        console.log(`[browser-bridge] 恢复后浏览器的 token Cookie 值长度: ${actualToken.value?.length || 0}`);
-      } else {
-        console.warn('[browser-bridge] 恢复后浏览器中没有找到 token Cookie！');
-      }
-    }
-    const origins = Array.isArray(snapshot?.origins) ? snapshot.origins : [];
-    if (origins.length > 0) {
-      await context.addInitScript((storedOrigins) => {
-        const matched = storedOrigins.find((origin) => origin.origin === window.location.origin);
-        if (!matched?.localStorage) {
-          return;
-        }
-        for (const item of matched.localStorage) {
-          try {
-            window.localStorage.setItem(item.name, item.value);
-          } catch {
-            // ignore
-          }
-        }
-      }, origins);
-    }
-    state.stateLoadOk = true;
-    state.stateLoadedAt = Date.now();
-    state.stateLastError = '';
-    return true;
-  } catch (error) {
-    // 文件不存在或读取失败是正常的（首次启动）
-    state.stateLoadOk = true;
-    state.stateLoadedAt = Date.now();
-    state.stateLastError = '';
-    return false;
-  }
-}
-
-async function persistBrowserState(context, reason = 'manual') {
-  if (!context) {
-    return false;
-  }
-
-  try {
-    const snapshot = await readBrowserStorageState(context);
-
-    // 确保登录相关的 Cookie 都被保存（增强日志）
-    const loginCookieNames = ['token', 'refresh_token', 'csrf_access_token', 'hdh_uid', 'hdh_sa_token'];
-    const savedLoginCookies = snapshot.cookies.filter(c => loginCookieNames.includes(c.name));
-    console.log(`[browser-bridge] 准备持久化 ${snapshot.cookies.length} 个 Cookie，其中登录相关 ${savedLoginCookies.length} 个: ${savedLoginCookies.map(c => c.name).join(', ')}`);
-
-    const stateData = {
-      ...snapshot,
-      meta: {
-        reason,
-        baseUrl: config.baseUrl,
-        savedAt: new Date().toISOString(),
-        hostname: os.hostname(),
-        loginCookieCount: savedLoginCookies.length
-      }
-    };
-
-    let dbSuccess = false;
-    let fileSuccess = false;
-
-    // 优先持久化到数据库
-    if (config.stateDatabaseUrl) {
-      try {
-        const pool = await ensureStateTable();
-        const encoded = encodeStateValue(stateData);
-        await pool.query(`
-          INSERT INTO browser_bridge_state (key, value, updated_at)
-          VALUES ($1, $2, NOW())
-          ON CONFLICT (key)
-          DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-        `, [config.stateKey, encoded]);
-        dbSuccess = true;
-        console.log(`[browser-bridge] 状态已持久化到数据库 (${reason})`);
-      } catch (error) {
-        console.warn('[browser-bridge] 持久化到数据库失败:', error instanceof Error ? error.message : String(error));
-      }
-    }
-
-    // 同时持久化到本地文件（兜底）
-    try {
-      const fs = await import('node:fs/promises');
-      const path = await import('node:path');
-      const stateFile = path.join(config.profileDir, 'browser-state.json');
-      await fs.writeFile(stateFile, JSON.stringify(stateData, null, 2), 'utf-8');
-      fileSuccess = true;
-      console.log(`[browser-bridge] 状态已持久化到本地文件 (${reason})`);
-    } catch (error) {
-      console.warn('[browser-bridge] 持久化到本地文件失败:', error instanceof Error ? error.message : String(error));
-    }
-
-    const success = dbSuccess || fileSuccess;
-    state.statePersistOk = success;
-    state.statePersistedAt = Date.now();
-    state.stateLastError = success ? '' : 'both db and file failed';
-    return success;
-  } catch (error) {
-    state.statePersistOk = false;
-    state.stateLastError = `persist: ${error instanceof Error ? error.message : String(error)}`;
-    if (state.shuttingDown && isBrowserContextUnavailableError(error)) {
-      console.warn('[browser-bridge] persist state skipped during shutdown:', state.stateLastError);
-    } else {
-      console.warn('[browser-bridge] persist state failed:', state.stateLastError);
-    }
-    return false;
-  }
-}
-
-async function readBrowserStorageState(context) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      await waitForContextPagesSettled(context);
-      const state = await context.storageState();
-
-      // 验证是否包含关键登录 Cookie
-      const loginCookieNames = ['token', 'refresh_token', 'csrf_access_token', 'hdh_uid'];
-      const hasLoginCookies = state.cookies.some(c => loginCookieNames.includes(c.name));
-
-      if (!hasLoginCookies && attempt < 3) {
-        console.warn(`[browser-bridge] storageState() 未返回登录 Cookie，尝试 fallback 方案 (尝试 ${attempt}/3)`);
-        throw new Error('storageState missing login cookies');
-      }
-
-      return state;
-    } catch (error) {
-      lastError = error;
-      if (!isRetryableStorageStateError(error) && !/missing login cookies/.test(String(error))) {
-        break;
-      }
-      await delay(350 * attempt);
-    }
-  }
-  return await readBrowserStorageStateFallback(context, lastError);
-}
-
-async function readBrowserStorageStateFallback(context, cause) {
-  const cookies = await readContextCookies(context).catch(() => []);
-  const origins = await readContextOrigins(context).catch(() => []);
-  if (cookies.length > 0 || origins.length > 0) {
-    return { cookies, origins };
-  }
-  throw cause || new Error('browser storage state is empty');
-}
-
-async function waitForContextPagesSettled(context) {
-  const pages = context.pages().filter((page) => !page.isClosed());
-  await Promise.all(pages.map(async (page) => {
-    await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => undefined);
-    await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => undefined);
-  }));
-}
-
-async function readContextCookies(context) {
-  try {
-    // 使用更可靠的方式获取 Cookie：尝试多种方法
-    let allCookies = await context.cookies().catch(() => []);
-
-    // 如果获取失败或为空，尝试从页面读取
-    if (allCookies.length === 0) {
-      const pages = context.pages().filter(p => !p.isClosed());
-      for (const page of pages) {
-        try {
-          const pageCookies = await page.context().cookies();
-          if (pageCookies.length > 0) {
-            allCookies = pageCookies;
-            break;
-          }
-        } catch {
-          continue;
-        }
-      }
-    }
-
-    console.log(`[browser-bridge] 读取到 ${allCookies.length} 个 Cookie，域名: ${[...new Set(allCookies.map(c => c.domain))].join(', ')}`);
-    return allCookies;
-  } catch (error) {
-    console.warn('[browser-bridge] 读取 Cookie 失败，尝试从页面读取:', error instanceof Error ? error.message : String(error));
-    const page = context.pages().find((candidate) => !candidate.isClosed() && candidate.url().startsWith(config.baseUrl));
-    if (!page) {
-      throw error;
-    }
-    const header = await page.evaluate(() => document.cookie || '');
-    return parseCookieHeader(header, config.baseUrl);
-  }
-}
-
-async function readContextOrigins(context) {
-  const origins = [];
-  const seen = new Set();
-  for (const page of context.pages()) {
-    if (page.isClosed() || !/^https?:\/\//i.test(page.url())) {
-      continue;
-    }
-    const origin = await page.evaluate(() => ({
-      origin: window.location.origin,
-      localStorage: Array.from({ length: window.localStorage.length }, (_, index) => {
-        const name = window.localStorage.key(index);
-        return name ? { name, value: window.localStorage.getItem(name) || '' } : null;
-      }).filter(Boolean)
-    })).catch(() => null);
-    if (!origin?.origin || seen.has(origin.origin)) {
-      continue;
-    }
-    seen.add(origin.origin);
-    origins.push(origin);
-  }
-  return origins;
-}
-
-function isRetryableStorageStateError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /Execution context was destroyed|navigation|Storage\.getCookies|Browser context management is not supported|Target page, context or browser has been closed|Protocol error/i.test(message);
-}
-
-function isBrowserContextUnavailableError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /Browser context management is not supported|Target page, context or browser has been closed|browser has been closed|Protocol error/i.test(message);
-}
-
-async function closeStateDatabase() {
-  if (!state.stateDbPool) {
-    return;
-  }
-  await state.stateDbPool.end().catch(() => undefined);
-  state.stateDbPool = null;
-  state.stateDbInitialized = false;
-}
-
-function resolveStateDatabaseSsl(databaseUrl, sslMode) {
-  const normalizedMode = String(sslMode || '').trim().toLowerCase();
-  if (['false', '0', 'off', 'disable'].includes(normalizedMode)) {
-    return false;
-  }
-  if (['verify-full'].includes(normalizedMode)) {
-    return true;
-  }
-  if (['true', '1', 'on', 'require', 'prefer', 'verify-ca'].includes(normalizedMode)) {
-    return { rejectUnauthorized: false };
-  }
-  try {
-    const url = new URL(databaseUrl);
-    const urlSslMode = String(url.searchParams.get('sslmode') || '').trim().toLowerCase();
-    if (['disable', 'false', '0', 'off'].includes(urlSslMode)) {
-      return false;
-    }
-    if (urlSslMode === 'verify-full') {
-      return true;
-    }
-    if (['require', 'prefer', 'verify-ca'].includes(urlSslMode)) {
-      return { rejectUnauthorized: false };
-    }
-    if (['localhost', '127.0.0.1', '::1'].includes(url.hostname)) {
-      return false;
-    }
-  } catch {
-    return { rejectUnauthorized: false };
-  }
-  return { rejectUnauthorized: false };
-}
-
-function normalizeStateDatabaseUrl(databaseUrl) {
-  try {
-    const url = new URL(databaseUrl);
-    url.searchParams.delete('sslmode');
-    return url.toString();
-  } catch {
-    return databaseUrl;
-  }
-}
-
-function normalizeUrlPathname(value) {
-  try {
-    return new URL(String(value || '/'), config.baseUrl).pathname;
-  } catch {
-    return String(value || '/').split('?')[0] || '/';
-  }
-}
-
-function isMissingResponseSignaturePayload(payload) {
-  const message = [
-    payload?.message,
-    payload?.description,
-    payload?.error,
-    payload?.name,
-    typeof payload === 'string' ? payload : ''
-  ].filter(Boolean).join(' ');
-  return /X-HDH-RSig|RSig|响应携带.*签名头|未收到.*签名头|Missing X-HDH-RSig/i.test(message);
-}
-
-function getCustomerPayloadFailure(payload, depth = 0) {
-  if (!payload || depth > 4) {
-    return '';
-  }
-  if (typeof payload === 'string') {
-    return isMissingResponseSignaturePayload(payload) ? payload : '';
-  }
-  if (Array.isArray(payload) || typeof payload !== 'object') {
-    return '';
-  }
-
-  const message = [
-    payload.message,
-    payload.description,
-    payload.error,
-    payload.name
-  ].filter((item) => typeof item === 'string' && item.trim()).join(' ');
-  if (isMissingResponseSignaturePayload(payload)) {
-    return message || '影巢响应签名校验失败';
-  }
-  if (payload.success === false || payload.ok === false) {
-    return message || '影巢业务响应失败';
-  }
-
-  const code = String(payload.code || payload.errorCode || payload.errCode || payload.httpStatus || '').trim();
-  if (/^(ERR_|ERROR|FAIL|FAILED)/i.test(code) || (/^\d+$/.test(code) && Number(code) >= 400)) {
-    return message || `影巢业务响应失败: ${code}`;
-  }
-  if (/未登录|登录态.*失效|unauthorized|forbidden|鉴权|权限不足/i.test(message)) {
-    return message;
-  }
-
-  return getCustomerPayloadFailure(payload.response, depth + 1)
-    || getCustomerPayloadFailure(payload.payload, depth + 1);
-}
-
-function encodeStateValue(value) {
-  const json = JSON.stringify(value);
-  if (!config.stateSecret) {
-    return JSON.stringify({ version: 1, encoding: 'plain-json', data: json });
-  }
-  const iv = randomBytes(12);
-  const key = createHash('sha256').update(config.stateSecret).digest();
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([cipher.update(json, 'utf8'), cipher.final()]);
-  return JSON.stringify({
-    version: 1,
-    encoding: 'aes-256-gcm',
-    iv: iv.toString('base64'),
-    tag: cipher.getAuthTag().toString('base64'),
-    data: encrypted.toString('base64')
-  });
-}
-
-function decodeStateValue(value) {
-  const parsed = JSON.parse(String(value || '{}'));
-  if (parsed.encoding === 'plain-json') {
-    return JSON.parse(parsed.data || '{}');
-  }
-  if (parsed.encoding !== 'aes-256-gcm') {
-    return parsed;
-  }
-  if (!config.stateSecret) {
-    throw new Error('BRIDGE_STATE_SECRET/BRIDGE_TOKEN 未配置，无法解密云端浏览器状态');
-  }
-  const key = createHash('sha256').update(config.stateSecret).digest();
-  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(parsed.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(parsed.data, 'base64')),
-    decipher.final()
-  ]);
-  return JSON.parse(decrypted.toString('utf8'));
-}
-
-async function safePageSummary(page, startedAt) {
-  return {
-    url: page.url(),
-    title: await page.title().catch(() => ''),
-    text: (await page.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 500),
-    elapsedMs: Date.now() - startedAt
-  };
-}
-
-async function closeBrowser(reason = 'close', options = {}) {
-  if (state.context) {
-    if (options.persist !== false) {
-      await persistBrowserState(state.context, reason).catch(() => false);
-    }
-    await state.context.close().catch(() => undefined);
-    state.context = null;
-  }
-  state.page = null;
-}
-
+// 优雅退出
 async function shutdown() {
-  if (state.shuttingDown) {
-    return;
-  }
-  state.shuttingDown = true;
-  console.log('[browser-bridge] shutting down');
-  await closeBrowser('shutdown');
-  await closeStateDatabase();
+  console.log('[hdhive-api] shutting down...');
+  if (state.client) await state.client.close().catch(() => {});
   process.exit(0);
 }
-
-async function buildStatus() {
-  const memory = process.memoryUsage();
-  const cookieStatus = await buildCookieStatus();
-  return {
-    uptimeSec: Math.round((Date.now() - state.startedAt) / 1000),
-    browserReady: Boolean(state.context && state.page && !state.page.isClosed()),
-    browserLaunchMs: state.browserLaunchMs,
-    browserAgeSec: state.browserLaunchAt ? Math.round((Date.now() - state.browserLaunchAt) / 1000) : 0,
-    lastWarmupAt: state.lastWarmupAt ? new Date(state.lastWarmupAt).toISOString() : null,
-    lastWarmupMs: state.lastWarmupMs,
-    lastWarmupOk: state.lastWarmupOk,
-    lastWarmupError: state.lastWarmupError,
-    warmupCount: state.warmupCount,
-    restartCount: state.restartCount,
-    activeAction: state.activeAction,
-    baseUrl: config.baseUrl,
-    hasCookie: cookieStatus.hasCookie,
-    hasConfiguredCookie: cookieStatus.hasConfiguredCookie,
-    hasRuntimeCookie: cookieStatus.hasRuntimeCookie,
-    hasLoginCookie: cookieStatus.hasLoginCookie,
-    runtimeCookieCount: cookieStatus.runtimeCookieCount,
-    hasUsername: Boolean(config.username),
-    protectedEndpoints: Boolean(config.bridgeToken),
-    cloudState: {
-      enabled: Boolean(config.stateDatabaseUrl),
-      key: config.stateDatabaseUrl ? config.stateKey : '',
-      encrypted: Boolean(config.stateDatabaseUrl && config.stateSecret),
-      loadedAt: state.stateLoadedAt ? new Date(state.stateLoadedAt).toISOString() : null,
-      persistedAt: state.statePersistedAt ? new Date(state.statePersistedAt).toISOString() : null,
-      loadOk: state.stateLoadOk,
-      persistOk: state.statePersistOk,
-      lastError: state.stateLastError
-    },
-    hostname: os.hostname(),
-    memory: {
-      rss: memory.rss,
-      heapUsed: memory.heapUsed,
-      heapTotal: memory.heapTotal
-    }
-  };
-}
-
-async function buildCookieStatus() {
-  const configuredCookies = parseCookieHeader(config.cookie, config.baseUrl);
-  let runtimeCookies = [];
-  if (state.context) {
-    runtimeCookies = await readContextCookies(state.context).catch(() => []);
-  }
-  const cookieNames = new Set([
-    ...configuredCookies.map((cookie) => cookie.name),
-    ...runtimeCookies.map((cookie) => cookie.name)
-  ]);
-  const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid'];
-  return {
-    hasCookie: configuredCookies.length > 0 || runtimeCookies.length > 0,
-    hasConfiguredCookie: configuredCookies.length > 0,
-    hasRuntimeCookie: runtimeCookies.length > 0,
-    hasLoginCookie: loginCookieNames.some((name) => cookieNames.has(name)),
-    runtimeCookieCount: runtimeCookies.length
-  };
-}
-
-function requireSensitiveEndpoint(req, res, next) {
-  if (!config.bridgeToken) {
-    res.status(403).json({
-      success: false,
-      error: 'BRIDGE_TOKEN 未配置，敏感接口已拒绝执行'
-    });
-    return;
-  }
-  next();
-}
-
-function parseWarmupUrls(value) {
-  return value
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function toAbsoluteUrl(value) {
-  const url = String(value || '/');
-  if (/^https?:\/\//i.test(url)) {
-    return url;
-  }
-  return `${config.baseUrl}${url.startsWith('/') ? '' : '/'}${url}`;
-}
-
-function trimTrailingSlash(value) {
-  return String(value || '').replace(/\/+$/, '');
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function parseCookieHeader(cookieHeader, baseUrl) {
-  if (!cookieHeader) {
-    return [];
-  }
-  const url = new URL(baseUrl);
-  return cookieHeader
-    .split(';')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const [name, ...valueParts] = part.split('=');
-      if (!name || valueParts.length === 0) {
-        return null;
-      }
-      return {
-        name,
-        value: valueParts.join('='),
-        domain: url.hostname,
-        path: '/',
-        httpOnly: false,
-        secure: url.protocol === 'https:',
-        sameSite: 'Lax'
-      };
-    })
-    .filter(Boolean);
-}
-
-function cookiesToHeader(cookies) {
-  return cookies
-    .filter((cookie) => cookie.name && cookie.value)
-    .map((cookie) => `${cookie.name}=${cookie.value}`)
-    .join('; ');
-}
-
-function pickPrimitiveQuery(value) {
-  if (!value || typeof value !== 'object') {
-    return {};
-  }
-  const query = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (['string', 'number', 'boolean'].includes(typeof item)) {
-      query[key] = String(item);
-    }
-  }
-  return query;
-}
-
-function pickHeaders(headers, names) {
-  const result = {};
-  for (const name of names) {
-    if (headers[name]) {
-      result[name] = headers[name];
-    }
-  }
-  return result;
-}
-
-function parseMaybeJson(value) {
-  if (!value) {
-    return null;
-  }
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
-function mergeResources(resources) {
-  const seen = new Set();
-  return resources.filter((resource) => {
-    const key = resource?.slug || resource?.id || resource?.pageUrl || resource?.media_url;
-    if (!key || seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function extractResourceCandidates(value, depth = 0) {
-  if (!value || depth > 6) {
-    return [];
-  }
-  const unwrapped = unwrapResourcePayload(value);
-  if (typeof unwrapped === 'string') {
-    const link = extractCloudLinkFromText(unwrapped);
-    if (!link) {
-      return [];
-    }
-    return [{
-      id: link,
-      slug: '',
-      title: '影巢天翼资源',
-      pan_type: '189',
-      media_url: link,
-      access_code: extractAccessCodeFromText(unwrapped),
-      is_unlocked: true,
-      source: 'payload-text'
-    }];
-  }
-  if (Array.isArray(unwrapped)) {
-    return unwrapped.flatMap((item) => extractResourceCandidates(item, depth + 1));
-  }
-  if (typeof unwrapped !== 'object') {
-    return [];
-  }
-
-  const nestedResources = Object.values(unwrapped).flatMap((item) => extractResourceCandidates(item, depth + 1));
-  if (!looksLikeResourceCandidate(unwrapped)) {
-    return nestedResources;
-  }
-  return [
-    normalizeResourceCandidate(unwrapped),
-    ...nestedResources
-  ];
-}
-
-function unwrapResourcePayload(value) {
-  let current = value;
-  for (let index = 0; index < 6; index += 1) {
-    if (!current || typeof current !== 'object' || Array.isArray(current) || looksLikeResourceCandidate(current)) {
-      return current;
-    }
-    if (current.response !== undefined) {
-      current = current.response;
-      continue;
-    }
-    if (current.payload !== undefined) {
-      current = current.payload;
-      continue;
-    }
-    if (current.success !== undefined && current.data !== undefined) {
-      current = current.data;
-      continue;
-    }
-    return current;
-  }
-  return current;
-}
-
-function looksLikeResourceCandidate(value) {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-  return Boolean(
-    value.slug
-    || value.id
-    || value.resourceId
-    || value.resource_id
-    || value.media_url
-    || value.mediaUrl
-    || value.full_url
-    || value.fullUrl
-    || value.shareLink
-    || value.share_link
-    || value.link
-    || value.url
-    || value.access_code
-    || value.accessCode
-    || value.netdisk_website_id
-    || value.net_disk_website_id
-    || value.website_id
-    || value.pan_type
-    || value.cloudType
-    || value.unlock_points !== undefined
-    || value.is_free !== undefined
-    || value.isFree !== undefined
-  );
-}
-
-function normalizeResourceCandidate(resource) {
-  const link = extractResourceLink(resource);
-  const resourceId = resource.slug || resource.id || resource.resourceId || resource.resource_id || link;
-  const accessCode = String(
-    resource.access_code
-    || resource.accessCode
-    || resource.code
-    || resource.password
-    || resource.passwd
-    || extractAccessCodeFromText(JSON.stringify(resource))
-    || ''
-  );
-  return {
-    ...resource,
-    id: String(resourceId || ''),
-    slug: resource.slug || resource.id || resource.resourceId || resource.resource_id || '',
-    title: resource.title || resource.name || resource.resource_name || resource.media_name || '影巢天翼资源',
-    pan_type: resource.pan_type || resource.netdisk_website_id || resource.net_disk_website_id || resource.website_id || resource.cloudType || '189',
-    media_url: link || resource.media_url || '',
-    access_code: accessCode,
-    is_unlocked: Boolean(resource.is_unlocked || resource.isUnlocked || link),
-    source: resource.source || 'payload'
-  };
-}
-
-function extractResourceLink(resource) {
-  const values = [
-    resource.media_url,
-    resource.mediaUrl,
-    resource.full_url,
-    resource.fullUrl,
-    resource.shareLink,
-    resource.share_link,
-    resource.link,
-    resource.url
-  ];
-  for (const value of values) {
-    const link = extractCloudLinkFromText(value);
-    if (link) {
-      return link;
-    }
-  }
-  return extractCloudLinkFromText(JSON.stringify(resource));
-}
-
-function extractCloudLinkFromText(value) {
-  const match = String(value || '').match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
-  return match?.[0] || '';
-}
-
-function extractAccessCodeFromText(value) {
-  const match = String(value || '').match(/(?:访问码|提取码|access_code|accessCode|code|password)["'：:\s=]+([A-Za-z0-9]{4})/i);
-  return match?.[1] || '';
-}
-
-function extractResourceEntriesFromHtml(html, pageUrl = config.baseUrl) {
-  const text = decodeFlightText(html);
-  const resources = [];
-  const seen = new Set();
-  const pathRegex = /\/resource\/(?:189|cloud189|8)\/([A-Za-z0-9._~-]+)/g;
-  let pathMatch;
-  while ((pathMatch = pathRegex.exec(text)) !== null) {
-    const start = Math.max(0, pathMatch.index - 1500);
-    const end = Math.min(text.length, pathMatch.index + 3500);
-    addResourceEntry(resources, seen, decodeURIComponent(pathMatch[1]), text.slice(start, end), pageUrl);
-  }
-
-  const slugRegex = /"slug"\s*:\s*"([^"]+)"/g;
-  let slugMatch;
-  while ((slugMatch = slugRegex.exec(text)) !== null) {
-    const start = Math.max(0, slugMatch.index - 2000);
-    const end = Math.min(text.length, slugMatch.index + 4500);
-    const block = text.slice(start, end);
-    if (!/(?:"(?:website|website_id|netdisk_website_id|net_disk_website_id|pan_type|cloudType)"\s*:\s*"?189"?|天翼|cloud189|\/resource\/189\/)/i.test(block)) {
-      continue;
-    }
-    addResourceEntry(resources, seen, decodeJsonString(slugMatch[1]), block, pageUrl);
-  }
-  return resources;
-}
-
-function addResourceEntry(resources, seen, slug, block, pageUrl) {
-  const normalizedSlug = String(slug || '').trim();
-  if (!normalizedSlug || seen.has(normalizedSlug)) {
-    return;
-  }
-  seen.add(normalizedSlug);
-  const linkMatch = block.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
-  resources.push({
-    id: normalizedSlug,
-    slug: normalizedSlug,
-    title: extractResourceTitle(block, `影巢天翼资源 ${resources.length + 1}`),
-    pan_type: '189',
-    share_size: getNumberField(block, 'share_size') || getNumberField(block, 'size') || getNumberField(block, 'file_size'),
-    unlock_points: getNumberField(block, 'unlock_points') || getNumberField(block, 'points') || getNumberField(block, 'cost'),
-    is_free: /(^|[\s"'([{,，:：])免费($|[\s"'\])},，。:：])/.test(block),
-    expired: /"expired"\s*:\s*true|"isExpired"\s*:\s*true|疑似失效/i.test(block),
-    is_unlocked: /"is_unlocked"\s*:\s*true|"isUnlocked"\s*:\s*true|已解锁|查看链接|复制链接/i.test(block),
-    media_url: linkMatch?.[0] || '',
-    pageUrl: `${config.baseUrl}/resource/189/${encodeURIComponent(normalizedSlug)}`,
-    sourcePageUrl: pageUrl,
-    source: 'html'
-  });
-}
-
-function extractResourceTitle(block, fallback) {
-  return getStringField(block, 'title')
-    || getStringField(block, 'name')
-    || getStringField(block, 'resource_name')
-    || getStringField(block, 'media_name')
-    || fallback;
-}
-
-function getStringField(block, field) {
-  const escapedField = escapeRegExp(field);
-  const match = block.match(new RegExp(`"${escapedField}"\\s*:\\s*"([^"]*)"`, 'i'));
-  return match?.[1] ? decodeJsonString(match[1]) : '';
-}
-
-function getNumberField(block, field) {
-  const escapedField = escapeRegExp(field);
-  const match = block.match(new RegExp(`"${escapedField}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`, 'i'));
-  return match ? Number(match[1]) : 0;
-}
-
-function decodeJsonString(value) {
-  try {
-    return JSON.parse(`"${String(value || '').replace(/"/g, '\\"')}"`);
-  } catch {
-    return value;
-  }
-}
-
-function normalizeResourceId(value) {
-  const resourceId = String(value || '').trim();
-  if (!/^[A-Za-z0-9._~-]+$/.test(resourceId)) {
-    throw new Error('resourceId 包含非法字符');
-  }
-  return resourceId;
-}
-
-function extractMediaResourceTarget(html, type, tmdbId, observedTargets = []) {
-  const observedTarget = observedTargets.find((target) => (
-    target?.target_type === 'media_resource'
-    && typeof target?.target_key === 'string'
-    && target.target_key.startsWith(`${type}:`)
-  ));
-  if (observedTarget) {
-    return observedTarget;
-  }
-  const text = decodeFlightText(html);
-  const escapedType = escapeRegExp(type);
-  const escapedTmdbId = escapeRegExp(String(tmdbId));
-  const targetKeyPattern = new RegExp(`"target_key"\\s*:\\s*"(${escapedType}:${escapedTmdbId})"[\\s\\S]{0,600}?"target_id"\\s*:\\s*(\\d+)`, 'i');
-  const targetKeyMatch = text.match(targetKeyPattern);
-  if (targetKeyMatch) {
-    return {
-      target_type: 'media_resource',
-      target_id: Number(targetKeyMatch[2]),
-      target_key: targetKeyMatch[1]
-    };
-  }
-  const reversePattern = new RegExp(`"target_id"\\s*:\\s*(\\d+)[\\s\\S]{0,600}?"target_key"\\s*:\\s*"(${escapedType}:${escapedTmdbId})"`, 'i');
-  const reverseMatch = text.match(reversePattern);
-  if (reverseMatch) {
-    return {
-      target_type: 'media_resource',
-      target_id: Number(reverseMatch[1]),
-      target_key: reverseMatch[2]
-    };
-  }
-  const genericTargetPattern = new RegExp(`"target_key"\\s*:\\s*"(${escapedType}:\\d+)"[\\s\\S]{0,800}?"target_type"\\s*:\\s*"media_resource"`, 'i');
-  const genericTargetMatch = text.match(genericTargetPattern);
-  if (genericTargetMatch) {
-    return {
-      target_type: 'media_resource',
-      target_key: genericTargetMatch[1]
-    };
-  }
-  const genericReversePattern = new RegExp(`"target_type"\\s*:\\s*"media_resource"[\\s\\S]{0,800}?"target_key"\\s*:\\s*"(${escapedType}:\\d+)"`, 'i');
-  const genericReverseMatch = text.match(genericReversePattern);
-  if (genericReverseMatch) {
-    return {
-      target_type: 'media_resource',
-      target_key: genericReverseMatch[1]
-    };
-  }
-  return {
-    target_type: 'media_resource',
-    target_key: `${type}:${tmdbId}`
-  };
-}
-
-function decodeFlightText(html) {
-  return String(html || '')
-    .replace(/&quot;/g, '"')
-    .replace(/&#x2F;/g, '/')
-    .replace(/\\u0026/g, '&')
-    .replace(/\\\//g, '/')
-    .replace(/\\"/g, '"')
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t');
-}
-
-function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
