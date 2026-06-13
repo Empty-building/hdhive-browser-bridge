@@ -444,7 +444,13 @@ export class HdhiveClient {
     const resources = await this.findResourcesFromMoviePage(resolved.url);
     console.log(`  → 找到 ${resources.length} 个资源`);
     if (resources.length === 0) {
-      return { success: false, error: 'no 189 resources found', resolved };
+      return {
+        success: false,
+        error: 'no 189 resources found for this movie',
+        tmdbId,
+        type,
+        resolved
+      };
     }
 
     const target = resources[0];

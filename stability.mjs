@@ -20,14 +20,20 @@ for (let i = 0; i < TMDB_IDS.length; i++) {
   try {
     const r = await client.unlockByTmdbId(tmdbId, 'movie');
     const elapsed = Date.now() - start;
-    successCount++;
-    results.push({
-      id: tmdbId,
-      ok: true,
-      time: elapsed,
-      cloud189: r.cloud189.fullText
-    });
-    console.log(`✓ [${i+1}/5] TMDB ${tmdbId}: ${elapsed}ms → ${r.cloud189.fullText}`);
+    if (r.success) {
+      successCount++;
+      results.push({
+        id: tmdbId,
+        ok: true,
+        time: elapsed,
+        cloud189: r.cloud189.fullText
+      });
+      console.log(`✓ [${i+1}/5] TMDB ${tmdbId}: ${elapsed}ms → ${r.cloud189.fullText}`);
+    } else {
+      failCount++;
+      results.push({ id: tmdbId, ok: false, time: elapsed, error: r.error });
+      console.log(`⊘ [${i+1}/5] TMDB ${tmdbId}: ${elapsed}ms → ${r.error}`);
+    }
   } catch (e) {
     failCount++;
     const elapsed = Date.now() - start;
@@ -37,16 +43,22 @@ for (let i = 0; i < TMDB_IDS.length; i++) {
 }
 
 console.log('\n━━━ 稳定性结果 ━━━');
-console.log(`成功: ${successCount}/5`);
-console.log(`失败: ${failCount}/5`);
+console.log(`成功(拿到网盘): ${successCount}/5`);
+console.log(`失败(无资源/异常): ${failCount}/5`);
 if (results.length > 0) {
-  const times = results.filter(r => r.ok).map(r => r.time);
-  if (times.length > 0) {
+  const okResults = results.filter(r => r.ok);
+  if (okResults.length > 0) {
+    const times = okResults.map(r => r.time);
     const avg = times.reduce((a, b) => a + b, 0) / times.length;
     const max = Math.max(...times);
     const min = Math.min(...times);
     console.log(`耗时: 平均 ${avg.toFixed(0)}ms, 最快 ${min}ms, 最慢 ${max}ms`);
   }
+}
+
+const noResource = results.filter(r => !r.ok && r.error?.includes('no 189'));
+if (noResource.length > 0) {
+  console.log(`\n注: ${noResource.length} 个电影本身没有 189 资源（数据问题，不是代码问题）`);
 }
 
 await client.close();
