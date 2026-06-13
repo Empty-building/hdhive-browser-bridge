@@ -85,6 +85,40 @@ docker-compose logs -f hdhive-api
 2. **请求头**：`x-hdhive-cookie: ...`
 3. **环境变量**：`HDHIVE_COOKIE`
 
+### Cookie 管理接口（容器化部署时推荐）
+
+| 接口 | 说明 |
+|------|------|
+| `POST /hdhive/login` | 账号密码登录，**返回新 cookie 字符串** |
+| `GET /hdhive/cookies` | 读取当前 client 的所有 cookies |
+| `POST /browser/restart` | 重启浏览器（清空登录态）|
+
+完整容器化部署流程：
+
+```bash
+# 1. 启动容器（不预置 cookie）
+docker run -d --name hdhive-api -p 10000:10000 \
+  -e BRIDGE_TOKEN=xxx hdhive-api:latest
+
+# 2. 通过 API 登录获取 cookie
+COOKIE=$(curl -s -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"you@email.com","password":"xxx"}' \
+  http://localhost:10000/hdhive/login | jq -r '.data.cookie')
+
+# 3. 用 cookie 调用 API
+curl -H "x-bridge-token: xxx" \
+  -H "x-hdhive-cookie: $COOKIE" \
+  http://localhost:10000/hdhive/customer/current
+
+# 或保存到环境变量并重启容器
+docker stop hdhive-api && docker rm hdhive-api
+docker run -d --name hdhive-api -p 10000:10000 \
+  -e BRIDGE_TOKEN=xxx \
+  -e HDHIVE_COOKIE="$COOKIE" \
+  hdhive-api:latest
+```
+
 ---
 
 ## 📡 API 接口
@@ -116,6 +150,49 @@ curl -X POST -H "x-bridge-token: xxx" \
   -H "Content-Type: application/json" \
   -d '{}' \
   http://localhost:10000/warmup
+```
+
+#### `POST /hdhive/login`
+账号密码登录，返回 cookie 字符串（**会消耗一次登录请求**）。
+
+```bash
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"your@email.com","password":"your-password"}' \
+  http://localhost:10000/hdhive/login
+```
+
+**返回**：
+```json
+{
+  "success": true,
+  "data": {
+    "cookie": "stel_ssid=...; hdh_sa_token=...; token=eyJ...; refresh_token=eyJ...; csrf_access_token=...; hdh_uid=30804",
+    "cookies": [
+      { "name": "hdh_sa_token", "value": "...", "domain": "hdhive.com", ... },
+      ...
+    ],
+    "user": { "hdh_uid": "30804" },
+    "note": "保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用"
+  }
+}
+```
+
+#### `GET /hdhive/cookies`
+读取当前 client 的所有 cookies（需要已登录）。
+
+```bash
+curl -H "x-bridge-token: xxx" http://localhost:10000/hdhive/cookies
+```
+
+#### `POST /browser/restart`
+重启浏览器（清空登录态）。
+
+```bash
+curl -X POST -H "x-bridge-token: xxx" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:10000/browser/restart
 ```
 
 ### Customer API（兼容原 bridge）

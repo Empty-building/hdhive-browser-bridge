@@ -3,7 +3,10 @@
 // 与 hdhive-browser-bridge 兼容，提供相同的 /hdhive/* 接口 + 新增 TMDB 一键解锁
 
 import express from 'express';
-import { HdhiveClient } from './api-client.mjs';
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
+import { HdhiveClient, STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT } from './api-client.mjs';
 
 const config = {
   port: Number(process.env.PORT || 10000),
@@ -275,6 +278,142 @@ app.get('/hdhive/public/bulletins/latest', async (req, res) => {
   const r = await withTimeout('public/bulletins/latest', async () => {
     const client = getClient(getRequestCookie(req));
     return await client.getBulletins();
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// ─────────────────── 账号密码登录 ───────────────────
+
+// 登录后获取 cookie 字符串（**会消耗一次登录请求**）
+// ⚠️ 此接口会实际登录影巢账号，建议只在 cookie 过期时调用
+app.post('/hdhive/login', async (req, res) => {
+  const r = await withTimeout('login', async () => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      throw new Error('username and password are required');
+    }
+
+    // 启动一个临时浏览器（独立 context，不影响主 client）
+    const { chromium } = await import('playwright');
+    const profileDir = path.join(os.tmpdir(), `hdhive-login-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(profileDir, { recursive: true });
+
+    const ctx = await chromium.launchPersistentContext(profileDir, {
+      headless: config.headless,
+      viewport: { width: 1366, height: 768 },
+      locale: 'zh-CN',
+      timezoneId: 'Asia/Shanghai',
+      userAgent: config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    try {
+      // 注入 stealth + RSC interceptor
+      await ctx.addInitScript(STEALTH_SCRIPT);
+
+      // 访问登录页
+      const page = await ctx.pages()[0] || await ctx.newPage();
+      await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+
+      // 等表单出现
+      let formFound = false;
+      for (let i = 0; i < 30; i++) {
+        if (await page.locator('input[type="password"]').count().catch(() => 0) > 0) {
+          formFound = true;
+          break;
+        }
+        await page.waitForTimeout(1000);
+      }
+      if (!formFound) throw new Error('login form not found');
+
+      // 填写表单
+      await page.locator('input[name="username"], input[type="email"], input[type="text"]').first().fill(username);
+      await page.locator('input[type="password"]').first().fill(password);
+      const submit = page.locator('button[type="submit"], button:has-text("登录")').first();
+      if (await submit.count() > 0) await submit.click();
+      else await page.locator('input[type="password"]').first().press('Enter');
+
+      // 等登录完成（URL 跳转走）
+      await page.waitForTimeout(15000);
+
+      // 提取 cookie
+      const cookies = await ctx.cookies();
+      const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+      const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid', 'hdh_sa_token'];
+      const hasLoginCookie = cookies.some(c => loginCookieNames.includes(c.name));
+
+      if (!hasLoginCookie) {
+        throw new Error('login failed: no login cookies found (可能需要验证码/二次验证)');
+      }
+
+      // 同时尝试获取用户信息验证
+      let userInfo = null;
+      try {
+        // 简化：尝试访问当前用户 API
+        const u = await page.evaluate(() => {
+          const m = document.cookie.match(/(?:^|;\s*)hdh_uid=([^;]+)/);
+          return m ? m[1] : null;
+        });
+        userInfo = { hdh_uid: u };
+      } catch {}
+
+      return {
+        cookie: cookieHeader,
+        cookies: cookies.map(c => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          expires: c.expires,
+          httpOnly: c.httpOnly,
+          secure: c.secure
+        })),
+        user: userInfo,
+        note: '保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用'
+      };
+    } finally {
+      await ctx.close().catch(() => {});
+    }
+  });
+
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 直接读取当前 client 的 cookies（需要已登录）
+app.get('/hdhive/cookies', async (req, res) => {
+  const r = await withTimeout('cookies', async () => {
+    if (!state.client) throw new Error('client not initialized');
+    const page = state.client._page;
+    if (!page) throw new Error('page not available');
+    const cookies = await page.context().cookies();
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    return {
+      cookie: cookieHeader,
+      cookies: cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        expires: c.expires,
+        httpOnly: c.httpOnly,
+        secure: c.secure
+      }))
+    };
+  });
+  res.status(r.success ? 200 : 500).json(r);
+});
+
+// 重启浏览器（清空登录态）
+app.post('/browser/restart', async (req, res) => {
+  const r = await withTimeout('browser/restart', async () => {
+    if (state.client) {
+      await state.client.close().catch(() => {});
+      state.client = null;
+      state.warmupOk = false;
+    }
+    // 下次调用会重建
+    return { restarted: true };
   });
   res.status(r.success ? 200 : 500).json(r);
 });

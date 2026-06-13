@@ -143,6 +143,9 @@ const RSC_INTERCEPTOR_SCRIPT = `
 })();
 `;
 
+// 导出 stealth 脚本供 server.mjs 复用
+export { STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT };
+
 export class HdhiveClient {
   constructor(options = {}) {
     this.baseUrl = (options.baseUrl || DEFAULT_BASE).replace(/\/$/, '');
