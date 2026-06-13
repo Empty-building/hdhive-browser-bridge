@@ -48,7 +48,10 @@ const state = {
   stateLoadOk: false,
   statePersistOk: false,
   stateLastError: '',
-  shuttingDown: false
+  shuttingDown: false,
+  lastLoginVerifyAt: 0,
+  loginFailureCount: 0,
+  loginFailureWindowStart: 0
 };
 
 const app = express();
@@ -309,6 +312,7 @@ async function ensurePage(retry = 0) {
         '--disable-features=Translate,BackForwardCache'
       ]
     });
+
     state.browserLaunchAt = startedAt;
     state.browserLaunchMs = Date.now() - startedAt;
     state.restartCount += 1;
@@ -478,29 +482,85 @@ async function warmup(urls) {
 
 let loggingIn = null;
 
-async function ensureLoggedIn(page) {
+async function ensureLoggedIn(page, options = {}) {
   if (!config.username || !config.password) {
     return false;
   }
+
+  // 检查登录失败次数限制（5分钟内最多失败3次）
+  const now = Date.now();
+  const failureWindowMs = 5 * 60 * 1000; // 5分钟
+  if (state.loginFailureWindowStart && (now - state.loginFailureWindowStart) > failureWindowMs) {
+    // 超过5分钟，重置计数
+    state.loginFailureCount = 0;
+    state.loginFailureWindowStart = 0;
+  }
+  if (state.loginFailureCount >= 3) {
+    const remainingMs = failureWindowMs - (now - state.loginFailureWindowStart);
+    console.warn(`[browser-bridge] 登录失败次数过多，等待 ${Math.ceil(remainingMs / 1000)}秒后重试`);
+    return false;
+  }
+
   const targetPage = page && !page.isClosed() ? page : await ensurePage();
   const cookies = await readContextCookies(targetPage.context()).catch(() => []);
   const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid'];
-  if (cookies.some((cookie) => loginCookieNames.includes(cookie.name))) {
+  const hasCookie = cookies.some((cookie) => loginCookieNames.includes(cookie.name));
+
+  // 如果要求验证登录态有效性，调用 /api/customer/user/current 确认
+  // 但有验证间隔保护：5分钟内只验证一次，避免频繁请求
+  if (hasCookie && options.verify) {
+    const verifyIntervalMs = 5 * 60 * 1000; // 5分钟
+    if (state.lastLoginVerifyAt && (now - state.lastLoginVerifyAt) < verifyIntervalMs) {
+      // 5分钟内已验证过，直接返回成功
+      return true;
+    }
+
+    console.log('[browser-bridge] 验证登录态有效性...');
+    const currentResult = await customerRequest('/api/customer/user/current', {
+      allowUnsignedResponseFallback: true
+    }).catch(() => ({ success: false }));
+
+    if (currentResult.success && !getCustomerPayloadFailure(currentResult.data?.payload || currentResult.data)) {
+      console.log('[browser-bridge] 登录态有效');
+      state.lastLoginVerifyAt = now; // 记录验证时间
+      // 登录验证成功，重置失败计数
+      state.loginFailureCount = 0;
+      state.loginFailureWindowStart = 0;
+      return true;
+    }
+    console.warn('[browser-bridge] 登录态无效或已过期，需要重新登录');
+  } else if (hasCookie) {
     return true;
   }
+
   if (loggingIn) {
     return loggingIn;
   }
-  console.log('[browser-bridge] 登录态缺失，自动使用环境变量账号重新登录');
+  console.log('[browser-bridge] 登录态缺失或失效，自动使用环境变量账号重新登录');
   loggingIn = loginWithPassword(config.username, config.password)
     .then((result) => {
       if (!result.success) {
         console.warn('[browser-bridge] 自动登录失败:', result.error || '未知错误');
+        // 记录失败
+        if (!state.loginFailureWindowStart) {
+          state.loginFailureWindowStart = Date.now();
+        }
+        state.loginFailureCount += 1;
+      } else {
+        state.lastLoginVerifyAt = Date.now(); // 登录成功后更新验证时间
+        // 登录成功，重置失败计数
+        state.loginFailureCount = 0;
+        state.loginFailureWindowStart = 0;
       }
       return Boolean(result.success);
     })
     .catch((error) => {
       console.warn('[browser-bridge] 自动登录异常:', error instanceof Error ? error.message : String(error));
+      // 记录失败
+      if (!state.loginFailureWindowStart) {
+        state.loginFailureWindowStart = Date.now();
+      }
+      state.loginFailureCount += 1;
       return false;
     })
     .finally(() => {
@@ -527,8 +587,8 @@ async function keepAlive() {
       page = await ensurePage();
     }
   }
-  // 续签登录态：仅在登录 cookie 缺失时才真正重登，正常只读 cookie，开销极小
-  await ensureLoggedIn(page).catch(() => false);
+  // 续签登录态：每次 keepAlive 都验证登录态有效性，确保登录态真实可用
+  await ensureLoggedIn(page, { verify: true }).catch(() => false);
   return { success: true, data: await buildStatus() };
 }
 
@@ -1057,7 +1117,7 @@ async function unlockResource(resourceId, body) {
   };
 }
 
-async function readResourcePage(resourceId, resourcePath) {
+async function readResourcePage(resourceId, resourcePath, retry = 0) {
   const page = await ensurePage();
   const startedAt = Date.now();
   const response = await page.goto(toAbsoluteUrl(resourcePath), {
@@ -1075,12 +1135,27 @@ async function readResourcePage(resourceId, resourcePath) {
       data: await safePageSummary(page, startedAt)
     };
   }
+
+  // 登录失效自动恢复
   if (/\/login(?:\?|$)/i.test(page.url())) {
-    return {
-      success: false,
-      error: '影巢登录态已失效，请重新登录或同步 Cookie',
-      data: await safePageSummary(page, startedAt)
-    };
+    if (retry >= 1) {
+      return {
+        success: false,
+        error: '影巢登录态已失效，自动重新登录后仍然失败',
+        data: await safePageSummary(page, startedAt)
+      };
+    }
+    console.warn('[browser-bridge] 资源详情页检测到登录态失效，尝试自动重新登录...');
+    const loginSuccess = await ensureLoggedIn(page);
+    if (!loginSuccess) {
+      return {
+        success: false,
+        error: '影巢登录态已失效，自动重新登录失败',
+        data: await safePageSummary(page, startedAt)
+      };
+    }
+    console.log('[browser-bridge] 自动重新登录成功，重试资源详情查询...');
+    return readResourcePage(resourceId, resourcePath, retry + 1);
   }
 
   const domResource = await scrapeCurrentCloud189Resource(page, resourceId);
@@ -1104,11 +1179,15 @@ async function readResourcePage(resourceId, resourcePath) {
   };
 }
 
-async function getMediaResources(type, tmdbId) {
+async function getMediaResources(type, tmdbId, retry = 0) {
   if (!['movie', 'tv'].includes(type) || !tmdbId) {
     return { success: false, error: 'type 必须是 movie/tv，tmdbId 不能为空' };
   }
+  const startedAt = Date.now();
+  const timings = { start: startedAt }; // 记录各步骤耗时
   const page = await ensurePage();
+  timings.ensurePage = Date.now() - startedAt;
+
   const mediaPath = `/tmdb/${type}/${encodeURIComponent(tmdbId)}`;
   const capturedTargets = [];
   const observedCustomerRequests = [];
@@ -1169,42 +1248,234 @@ async function getMediaResources(type, tmdbId) {
   page.on('request', onRequest);
   page.on('response', onResponse);
   try {
-    await page.goto(toAbsoluteUrl(mediaPath), {
-      waitUntil: 'domcontentloaded',
-      timeout: config.navigationTimeoutMs
-    });
-    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+    console.log(`[browser-bridge] 查询资源: ${mediaPath}`);
+
+    // 检查是否已经在目标页面，避免不必要的重新导航
+    const currentUrl = page.url();
+    const targetUrl = toAbsoluteUrl(mediaPath);
+
+    // 更宽松的判断：只要URL包含movie ID就认为在目标页面
+    const movieIdMatch = mediaPath.match(/\/movie\/(\w+)/);
+    const tmdbIdMatch = mediaPath.match(/\/tmdb\/movie\/(\d+)/);
+    const isOnTargetPage = movieIdMatch ? currentUrl.includes(movieIdMatch[1]) :
+                           tmdbIdMatch ? currentUrl.includes(`/movie/`) && !currentUrl.includes('/login') :
+                           currentUrl === targetUrl;
+
+    console.log(`[browser-bridge] 当前URL: ${currentUrl}, 目标: ${targetUrl}, 在目标页: ${isOnTargetPage}`);
+
+    if (!isOnTargetPage) {
+      console.log(`[browser-bridge] 导航到页面: ${targetUrl}`);
+      const navStart = Date.now();
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: config.navigationTimeoutMs
+        });
+      } catch (error) {
+        // 如果导航被中止，可能是因为反爬检测或重定向，检查当前 URL
+        const currentUrl = page.url();
+        console.warn(`[browser-bridge] 导航异常: ${error instanceof Error ? error.message : String(error)}, 当前URL: ${currentUrl}`);
+
+        // 如果跳转到了登录页，说明登录态失效
+        if (/\/login(?:\?|$)/i.test(currentUrl)) {
+          throw error; // 让后面的登录检测逻辑处理
+        }
+
+        // 如果已经在目标类型的页面（movie/tv），即使 URL 不完全匹配也继续
+        if (currentUrl.includes(`/${type}/`) || currentUrl.includes(`/tmdb/${type}/`)) {
+          console.log(`[browser-bridge] 导航被中止但已到达相关页面，继续执行`);
+        } else {
+          throw error; // 其他情况抛出错误
+        }
+      }
+      timings.navigation = Date.now() - navStart;
+
+      const waitStart = Date.now();
+      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+      timings.networkIdle = Date.now() - waitStart;
+    } else {
+      console.log(`[browser-bridge] 已在目标页面，跳过导航`);
+      timings.navigation = 0;
+      // 虽然不导航，但等待一下确保页面稳定
+      await page.waitForTimeout(500);
+      timings.networkIdle = 500;
+    }
+
     await dismissKnownNotice(page);
-    await scrollPage(page, 6, 900, 400);
 
     const pageText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
     if (/出现了很奇怪的错误/.test(pageText)) {
       return {
         success: false,
         error: '影巢详情页拒绝当前浏览器环境，请重启 Bridge 或尝试关闭 Headless',
-        data: await safePageSummary(page, Date.now())
+        data: await safePageSummary(page, startedAt)
       };
     }
+
+    // 登录失效自动恢复
     if (/\/login(?:\?|$)/i.test(page.url())) {
-      return {
-        success: false,
-        error: '影巢登录态已失效，请重新登录或同步 Cookie',
-        data: await safePageSummary(page, Date.now())
-      };
+      if (retry >= 1) {
+        return {
+          success: false,
+          error: '影巢登录态已失效，自动重新登录后仍然失败',
+          data: await safePageSummary(page, startedAt)
+        };
+      }
+      console.warn('[browser-bridge] 检测到登录态失效，尝试自动重新登录...');
+      const loginSuccess = await ensureLoggedIn(page);
+      if (!loginSuccess) {
+        return {
+          success: false,
+          error: '影巢登录态已失效，自动重新登录失败',
+          data: await safePageSummary(page, startedAt)
+        };
+      }
+      console.log('[browser-bridge] 自动重新登录成功，重试资源查询...');
+      page.off('request', onRequest);
+      page.off('response', onResponse);
+      return getMediaResources(type, tmdbId, retry + 1);
     }
 
+    // 优化后的滚动策略 - 减少等待时间
+    console.log('[browser-bridge] 智能加载资源...');
+    const scrollStart = Date.now();
+
+    // 快速初始滚动 - 只等待 1.5 秒让关键内容加载
+    await page.waitForTimeout(1500);
+
+    let foundResources = false;
+    // 减少滚动次数：从 10 次降到 6 次
+    for (let i = 0; i < 6; i++) {
+      const scrollAmount = 600 + Math.random() * 200;
+      await page.mouse.wheel(0, scrollAmount);
+
+      // 减少等待时间：从 400-700ms 降到 200-400ms
+      const waitTime = 200 + Math.random() * 200;
+      await page.waitForTimeout(waitTime);
+
+      // 每 2 次检测一次
+      if (i % 2 === 1) {
+        const quickCheck = await page.locator('a[href*="/resource/189/"]').count().catch(() => 0);
+        if (quickCheck > 0) {
+          console.log(`[browser-bridge] 滚动 ${i + 1} 次后检测到 ${quickCheck} 个资源链接`);
+          foundResources = true;
+          break;
+        }
+      }
+    }
+    timings.initialScroll = Date.now() - scrollStart;
+
+    // 尝试点击天翼云盘标签
+    const tabStart = Date.now();
     const clickedCloud189Tab = await clickCloud189Tab(page);
+    timings.clickTab = Date.now() - tabStart;
+
     if (clickedCloud189Tab) {
-      await page.waitForTimeout(1500);
-      await scrollPage(page, 4, 700, 250);
+      console.log('[browser-bridge] 成功点击天翼云盘标签');
+      // 点击后等待 2 秒（从 3 秒优化到 2 秒）
+      await page.waitForTimeout(2000);
+
+      // 再次滚动，减少次数：从 8 次降到 5 次
+      const scrollAfterTabStart = Date.now();
+      for (let i = 0; i < 5; i++) {
+        const scrollAmount = 500 + Math.random() * 200;
+        await page.mouse.wheel(0, scrollAmount);
+
+        const waitTime = 250 + Math.random() * 150;
+        await page.waitForTimeout(waitTime);
+
+        // 检测资源
+        if (i % 2 === 1) {
+          const count = await page.locator('a[href*="/resource/189/"]').count().catch(() => 0);
+          if (count > 0) {
+            console.log(`[browser-bridge] 点击标签后滚动 ${i + 1} 次，检测到 ${count} 个资源链接`);
+            if (count >= 3) break; // 找到足够的资源就停止
+          }
+        }
+      }
+      timings.scrollAfterTab = Date.now() - scrollAfterTabStart;
+    } else if (!foundResources) {
+      console.warn('[browser-bridge] 未找到天翼云盘标签，尝试继续提取资源');
+      // 没找到标签，再滚动一些（从 6 次降到 4 次）
+      for (let i = 0; i < 4; i++) {
+        await page.mouse.wheel(0, 600);
+        await page.waitForTimeout(400);
+      }
+      timings.scrollAfterTab = 1600;
     }
 
+    // 最后等待，从 1.5 秒优化到 1 秒
+    await page.waitForTimeout(1000);
+
+    const extractStart = Date.now();
     const html = await page.content();
     const target = extractMediaResourceTarget(html, type, tmdbId, capturedTargets);
     const domResources = await scrapeCloud189Resources(page);
     const htmlResources = extractResourceEntriesFromHtml(html, page.url());
     const resources = mergeResources([...domResources, ...htmlResources]);
+    timings.extract = Date.now() - extractStart;
+
+    // 如果提取到0个资源且是第一次尝试，等待后重试提取（优化等待时间）
+    if (resources.length === 0 && retry === 0) {
+      console.warn('[browser-bridge] 第一次提取到0个资源，等待3秒后重试提取...');
+      await page.waitForTimeout(3000); // 从 5 秒降到 3 秒
+
+      // 再次滚动（减少次数）
+      for (let i = 0; i < 3; i++) {
+        await page.mouse.wheel(0, 700);
+        await page.waitForTimeout(500);
+      }
+
+      // 重新提取
+      const retryExtractStart = Date.now();
+      const html2 = await page.content();
+      const domResources2 = await scrapeCloud189Resources(page);
+      const htmlResources2 = extractResourceEntriesFromHtml(html2, page.url());
+      const resources2 = mergeResources([...domResources2, ...htmlResources2]);
+      timings.retryExtract = Date.now() - retryExtractStart;
+
+      if (resources2.length > 0) {
+        console.log(`[browser-bridge] 重试提取成功！找到 ${resources2.length} 个资源`);
+        const statePersisted = await persistBrowserState(page.context(), 'media-resources');
+
+        timings.total = Date.now() - startedAt;
+        console.log(`[browser-bridge] DOM提取: ${domResources2.length} 个, HTML提取: ${htmlResources2.length} 个, 合并后: ${resources2.length} 个资源，总耗时 ${timings.total}ms`);
+        console.log(`[browser-bridge] 耗时分解: 准备${timings.ensurePage}ms, 导航${timings.navigation}ms, 网络${timings.networkIdle}ms, 滚动${timings.initialScroll}ms, 点击标签${timings.clickTab}ms, 标签后滚动${timings.scrollAfterTab}ms, 提取${timings.extract}ms, 重试提取${timings.retryExtract}ms`);
+
+        const payload = {
+          success: true,
+          data: resources2,
+          message: resources2.length ? 'success' : '未找到天翼云盘资源',
+          code: '200'
+        };
+        return {
+          success: true,
+          data: {
+            mediaPath,
+            pageUrl: page.url(),
+            target,
+            payload,
+            resources: resources2,
+            captured: true,
+            source: 'page-rendered-resources',
+            statePersisted,
+            clickedCloud189Tab,
+            observedCustomerRequests: observedCustomerRequests.slice(-20),
+            elapsedMs: timings.total,
+            timings,
+            retried: true
+          }
+        };
+      }
+      console.warn('[browser-bridge] 重试提取仍然是0个资源');
+    }
+
     const statePersisted = await persistBrowserState(page.context(), 'media-resources');
+    timings.total = Date.now() - startedAt;
+
+    console.log(`[browser-bridge] DOM提取: ${domResources.length} 个, HTML提取: ${htmlResources.length} 个, 合并后: ${resources.length} 个资源，总耗时 ${timings.total}ms`);
+    console.log(`[browser-bridge] 耗时分解: 准备${timings.ensurePage}ms, 导航${timings.navigation}ms, 网络${timings.networkIdle}ms, 滚动${timings.initialScroll}ms, 点击标签${timings.clickTab}ms, 标签后滚动${timings.scrollAfterTab || 0}ms, 提取${timings.extract}ms`);
+
     const payload = {
       success: true,
       data: resources,
@@ -1224,7 +1495,9 @@ async function getMediaResources(type, tmdbId) {
         statePersisted,
         clickedCloud189Tab,
         observedCustomerRequests: observedCustomerRequests.slice(-20),
-        capturedResponses: capturedResponses.slice(-20)
+        capturedResponses: capturedResponses.slice(-20),
+        elapsedMs: timings.total,
+        timings
       }
     };
   } finally {
@@ -1245,7 +1518,10 @@ async function scrollPage(page, times, deltaY, waitMs) {
 }
 
 async function clickCloud189Tab(page) {
-  for (let index = 0; index < 12; index += 1) {
+  // 优化：减少等待时间和尝试次数
+  await page.waitForTimeout(800); // 从 1500ms 降到 800ms
+
+  for (let index = 0; index < 10; index += 1) { // 从 15 次降到 10 次
     const clicked = await page.evaluate(() => {
       const isVisible = (node) => {
         const rect = node.getBoundingClientRect();
@@ -1253,7 +1529,7 @@ async function clickCloud189Tab(page) {
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
       const textOf = (node) => (node.innerText || node.textContent || '').trim();
-      const candidates = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],a'));
+      const candidates = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],a,div[class*="tab"],span[class*="tab"]'));
       const exact = candidates.find((node) => isVisible(node) && /天翼云盘/.test(textOf(node)));
       const fallback = candidates.find((node) => isVisible(node) && (/\b189\b/.test(textOf(node)) || /天翼/.test(textOf(node))));
       const target = exact || fallback;
@@ -1265,11 +1541,18 @@ async function clickCloud189Tab(page) {
       return true;
     }).catch(() => false);
     if (clicked) {
+      console.log(`[browser-bridge] 第 ${index + 1} 次尝试成功点击天翼云盘标签`);
       return true;
     }
-    await page.mouse.wheel(0, 700);
-    await page.waitForTimeout(350);
+    // 优化：前 3 次快速重试，后续适度滚动
+    if (index < 3) {
+      await page.waitForTimeout(500); // 从 800ms 降到 500ms
+    } else {
+      await page.mouse.wheel(0, 400); // 从 500 降到 400
+      await page.waitForTimeout(400); // 从 500ms 降到 400ms
+    }
   }
+  console.warn('[browser-bridge] 尝试 10 次后仍未找到天翼云盘标签');
   return false;
 }
 
@@ -1350,6 +1633,8 @@ async function scrapeCloud189Resources(page) {
       };
     };
     const anchors = Array.from(document.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'));
+    // 返回调试信息
+    console.log('[DOM] Found', anchors.length, 'resource anchors');
     return anchors.map(parseResource).filter(Boolean);
   }).catch(() => []);
 }
@@ -1424,23 +1709,72 @@ async function ensureStateTable() {
 }
 
 async function restoreBrowserState(context) {
-  if (!config.stateDatabaseUrl) {
-    return false;
-  }
-  try {
-    const pool = await ensureStateTable();
-    const result = await pool.query('SELECT value, updated_at FROM browser_bridge_state WHERE key = $1', [config.stateKey]);
-    const rawValue = result.rows[0]?.value;
-    if (!rawValue) {
-      state.stateLoadOk = true;
-      state.stateLoadedAt = Date.now();
-      state.stateLastError = '';
-      return false;
+  // 优先从数据库恢复
+  if (config.stateDatabaseUrl) {
+    try {
+      const pool = await ensureStateTable();
+      const result = await pool.query('SELECT value, updated_at FROM browser_bridge_state WHERE key = $1', [config.stateKey]);
+      const rawValue = result.rows[0]?.value;
+      if (rawValue) {
+        const snapshot = decodeStateValue(rawValue);
+        const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
+        if (cookies.length > 0) {
+          await context.addCookies(cookies);
+          console.log(`[browser-bridge] 从数据库恢复 ${cookies.length} 个 Cookie`);
+        }
+        const origins = Array.isArray(snapshot?.origins) ? snapshot.origins : [];
+        if (origins.length > 0) {
+          await context.addInitScript((storedOrigins) => {
+            const matched = storedOrigins.find((origin) => origin.origin === window.location.origin);
+            if (!matched?.localStorage) {
+              return;
+            }
+            for (const item of matched.localStorage) {
+              try {
+                window.localStorage.setItem(item.name, item.value);
+              } catch {
+                // ignore
+              }
+            }
+          }, origins);
+        }
+        state.stateLoadOk = true;
+        state.stateLoadedAt = Date.now();
+        state.stateLastError = '';
+        return true;
+      }
+    } catch (error) {
+      state.stateLoadOk = false;
+      state.stateLastError = `restore from db: ${error instanceof Error ? error.message : String(error)}`;
+      console.warn('[browser-bridge] 从数据库恢复状态失败，尝试本地文件:', state.stateLastError);
     }
-    const snapshot = decodeStateValue(rawValue);
+  }
+
+  // 从本地文件恢复（兜底方案）
+  try {
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const stateFile = path.join(config.profileDir, 'browser-state.json');
+    const fileContent = await fs.readFile(stateFile, 'utf-8');
+    const snapshot = JSON.parse(fileContent);
     const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
     if (cookies.length > 0) {
+      // 调试：检查恢复的 Cookie 是否有值
+      const tokenCookie = cookies.find(c => c.name === 'token');
+      if (tokenCookie) {
+        console.log(`[browser-bridge] 恢复的 token Cookie 值长度: ${tokenCookie.value?.length || 0}`);
+      }
       await context.addCookies(cookies);
+      console.log(`[browser-bridge] 从本地文件恢复 ${cookies.length} 个 Cookie`);
+
+      // 验证恢复后的 Cookie
+      const actualCookies = await context.cookies();
+      const actualToken = actualCookies.find(c => c.name === 'token');
+      if (actualToken) {
+        console.log(`[browser-bridge] 恢复后浏览器的 token Cookie 值长度: ${actualToken.value?.length || 0}`);
+      } else {
+        console.warn('[browser-bridge] 恢复后浏览器中没有找到 token Cookie！');
+      }
     }
     const origins = Array.isArray(snapshot?.origins) ? snapshot.origins : [];
     if (origins.length > 0) {
@@ -1463,39 +1797,76 @@ async function restoreBrowserState(context) {
     state.stateLastError = '';
     return true;
   } catch (error) {
-    state.stateLoadOk = false;
-    state.stateLastError = `restore: ${error instanceof Error ? error.message : String(error)}`;
-    console.warn('[browser-bridge] restore state skipped:', state.stateLastError);
+    // 文件不存在或读取失败是正常的（首次启动）
+    state.stateLoadOk = true;
+    state.stateLoadedAt = Date.now();
+    state.stateLastError = '';
     return false;
   }
 }
 
 async function persistBrowserState(context, reason = 'manual') {
-  if (!config.stateDatabaseUrl || !context) {
+  if (!context) {
     return false;
   }
+
   try {
-    const pool = await ensureStateTable();
     const snapshot = await readBrowserStorageState(context);
-    const encoded = encodeStateValue({
+
+    // 确保登录相关的 Cookie 都被保存（增强日志）
+    const loginCookieNames = ['token', 'refresh_token', 'csrf_access_token', 'hdh_uid', 'hdh_sa_token'];
+    const savedLoginCookies = snapshot.cookies.filter(c => loginCookieNames.includes(c.name));
+    console.log(`[browser-bridge] 准备持久化 ${snapshot.cookies.length} 个 Cookie，其中登录相关 ${savedLoginCookies.length} 个: ${savedLoginCookies.map(c => c.name).join(', ')}`);
+
+    const stateData = {
       ...snapshot,
       meta: {
         reason,
         baseUrl: config.baseUrl,
         savedAt: new Date().toISOString(),
-        hostname: os.hostname()
+        hostname: os.hostname(),
+        loginCookieCount: savedLoginCookies.length
       }
-    });
-    await pool.query(`
-      INSERT INTO browser_bridge_state (key, value, updated_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (key)
-      DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-    `, [config.stateKey, encoded]);
-    state.statePersistOk = true;
+    };
+
+    let dbSuccess = false;
+    let fileSuccess = false;
+
+    // 优先持久化到数据库
+    if (config.stateDatabaseUrl) {
+      try {
+        const pool = await ensureStateTable();
+        const encoded = encodeStateValue(stateData);
+        await pool.query(`
+          INSERT INTO browser_bridge_state (key, value, updated_at)
+          VALUES ($1, $2, NOW())
+          ON CONFLICT (key)
+          DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        `, [config.stateKey, encoded]);
+        dbSuccess = true;
+        console.log(`[browser-bridge] 状态已持久化到数据库 (${reason})`);
+      } catch (error) {
+        console.warn('[browser-bridge] 持久化到数据库失败:', error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    // 同时持久化到本地文件（兜底）
+    try {
+      const fs = await import('node:fs/promises');
+      const path = await import('node:path');
+      const stateFile = path.join(config.profileDir, 'browser-state.json');
+      await fs.writeFile(stateFile, JSON.stringify(stateData, null, 2), 'utf-8');
+      fileSuccess = true;
+      console.log(`[browser-bridge] 状态已持久化到本地文件 (${reason})`);
+    } catch (error) {
+      console.warn('[browser-bridge] 持久化到本地文件失败:', error instanceof Error ? error.message : String(error));
+    }
+
+    const success = dbSuccess || fileSuccess;
+    state.statePersistOk = success;
     state.statePersistedAt = Date.now();
-    state.stateLastError = '';
-    return true;
+    state.stateLastError = success ? '' : 'both db and file failed';
+    return success;
   } catch (error) {
     state.statePersistOk = false;
     state.stateLastError = `persist: ${error instanceof Error ? error.message : String(error)}`;
@@ -1513,10 +1884,21 @@ async function readBrowserStorageState(context) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       await waitForContextPagesSettled(context);
-      return await context.storageState();
+      const state = await context.storageState();
+
+      // 验证是否包含关键登录 Cookie
+      const loginCookieNames = ['token', 'refresh_token', 'csrf_access_token', 'hdh_uid'];
+      const hasLoginCookies = state.cookies.some(c => loginCookieNames.includes(c.name));
+
+      if (!hasLoginCookies && attempt < 3) {
+        console.warn(`[browser-bridge] storageState() 未返回登录 Cookie，尝试 fallback 方案 (尝试 ${attempt}/3)`);
+        throw new Error('storageState missing login cookies');
+      }
+
+      return state;
     } catch (error) {
       lastError = error;
-      if (!isRetryableStorageStateError(error)) {
+      if (!isRetryableStorageStateError(error) && !/missing login cookies/.test(String(error))) {
         break;
       }
       await delay(350 * attempt);
@@ -1544,8 +1926,29 @@ async function waitForContextPagesSettled(context) {
 
 async function readContextCookies(context) {
   try {
-    return await context.cookies(config.baseUrl);
+    // 使用更可靠的方式获取 Cookie：尝试多种方法
+    let allCookies = await context.cookies().catch(() => []);
+
+    // 如果获取失败或为空，尝试从页面读取
+    if (allCookies.length === 0) {
+      const pages = context.pages().filter(p => !p.isClosed());
+      for (const page of pages) {
+        try {
+          const pageCookies = await page.context().cookies();
+          if (pageCookies.length > 0) {
+            allCookies = pageCookies;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    console.log(`[browser-bridge] 读取到 ${allCookies.length} 个 Cookie，域名: ${[...new Set(allCookies.map(c => c.domain))].join(', ')}`);
+    return allCookies;
   } catch (error) {
+    console.warn('[browser-bridge] 读取 Cookie 失败，尝试从页面读取:', error instanceof Error ? error.message : String(error));
     const page = context.pages().find((candidate) => !candidate.isClosed() && candidate.url().startsWith(config.baseUrl));
     if (!page) {
       throw error;
@@ -1748,8 +2151,8 @@ async function closeBrowser(reason = 'close', options = {}) {
       await persistBrowserState(state.context, reason).catch(() => false);
     }
     await state.context.close().catch(() => undefined);
+    state.context = null;
   }
-  state.context = null;
   state.page = null;
 }
 
