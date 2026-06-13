@@ -14,6 +14,8 @@ const config = {
   port: Number(process.env.PORT || 10000),
   bridgeToken: String(process.env.BRIDGE_TOKEN || ''),
   defaultCookie: String(process.env.HDHIVE_COOKIE || ''),
+  defaultUsername: String(process.env.HDHIVE_USERNAME || ''),
+  defaultPassword: String(process.env.HDHIVE_PASSWORD || ''),
   baseUrl: String(process.env.HDHIVE_BASE_URL || 'https://hdhive.com'),
   headless: process.env.BROWSER_HEADLESS !== 'false',
   // 接口超时（单个请求最长执行时间）
@@ -314,7 +316,8 @@ app.post('/warmup', async (req, res) => {
 app.get('/hdhive/customer/current', async (req, res) => {
   const r = await withTimeout('customer/current', async () => {
     const client = getClient(await getRequestCookieAsync(req));
-    return await client.getCurrentUser();
+    const result = await client.getCurrentUser();
+    return { ...result, payload: result.data };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -323,7 +326,8 @@ app.get('/hdhive/customer/current', async (req, res) => {
 app.get('/hdhive/customer/points-logs', async (req, res) => {
   const r = await withTimeout('customer/points-logs', async () => {
     const client = getClient(await getRequestCookieAsync(req));
-    return await client.getPointsLogs(req.query);
+    const result = await client.getPointsLogs(req.query);
+    return { ...result, payload: result.data };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -332,7 +336,8 @@ app.get('/hdhive/customer/points-logs', async (req, res) => {
 app.post('/hdhive/customer/checkin', async (req, res) => {
   const r = await withTimeout('customer/checkin', async () => {
     const client = getClient(await getRequestCookieAsync(req));
-    return await client.checkin();
+    const result = await client.checkin();
+    return { ...result, payload: result.data };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -389,6 +394,7 @@ app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
     const link = cloud189?.url || apiData?.url || '';
     const code = cloud189?.accessCode || apiData?.access_code || '';
     const isUnlocked = Boolean(cloud189?.url) || apiData?.is_unlocked || false;
+    const unlockPoints = apiData?.unlock_points ?? apiData?.default_unlock_points ?? (apiData?.is_free ? 0 : null);
 
     return {
       // cloud189-auto-save 期望
@@ -407,8 +413,8 @@ app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
         accessCode: code,
         size: apiData?.share_size || 0,
         sizeFormatted: formatSize(apiData?.share_size || 0),
-        points: apiData?.unlock_points ?? 0,
-        isFree: apiData?.unlock_points === 0,
+        points: unlockPoints,
+        isFree: unlockPoints === 0,
         isUnlocked,
         movieId: apiData?.movie_id,
         tvId: apiData?.tv_id,
@@ -495,66 +501,6 @@ app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
   res.status(r.success ? 200 : 500).json(r);
 });
 
-// ⭐ 资源详情（兼容 cloud189-auto-save 期望的格式）
-app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
-  const r = await withTimeout('customer/resources', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    const slug = req.params.resourceId;
-
-    // 1. API 查询
-    let apiData = null;
-    try {
-      const r = await client.getResource(slug);
-      apiData = r.data?.data;
-    } catch {}
-
-    // 2. 爬 189 链接（已解锁的话能拿到）
-    let cloud189 = null;
-    try {
-      cloud189 = await client.getCloud189Links(slug);
-    } catch {}
-
-    const link = cloud189?.url || apiData?.url || '';
-    const code = cloud189?.accessCode || apiData?.access_code || '';
-    const isUnlocked = Boolean(cloud189?.url) || apiData?.is_unlocked || false;
-
-    return {
-      // cloud189-auto-save 期望
-      link,
-      code,
-      accessCode: code,
-      fullUrl: link && code ? `${link}（访问码：${code}）` : link,
-      // 嵌套 resources
-      resources: [{
-        id: slug,
-        slug,
-        title: apiData?.title || '未命名资源',
-        cloudType: 'cloud189',
-        link,
-        code,
-        accessCode: code,
-        size: apiData?.share_size || 0,
-        sizeFormatted: formatSize(apiData?.share_size || 0),
-        points: apiData?.unlock_points ?? 0,
-        isFree: apiData?.unlock_points === 0,
-        isUnlocked,
-        movieId: apiData?.movie_id,
-        tvId: apiData?.tv_id,
-        uploader: apiData?.user || {},
-        createdAt: apiData?.created_at
-      }],
-      detail: {
-        link,
-        code,
-        accessCode: code
-      },
-      payload: apiData,
-      raw: apiData
-    };
-  });
-  res.status(r.success ? 200 : 500).json(r);
-});
-
 // 检查资源
 app.post('/hdhive/customer/check/resource', async (req, res) => {
   const r = await withTimeout('customer/check/resource', async () => {
@@ -584,46 +530,46 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
     // 3. 对每个资源查积分 + 尝试拿 189 链接（不消耗积分，但 getCloud189Links 需要已解锁）
     const enriched = [];
     for (const r of resources) {
+      let info = {};
+      let infoError = null;
       try {
-        const check = await client.checkResource(`${config.baseUrl}/resource/189/${r.slug}`);
-        const d = check.data?.data || {};
-        // 尝试拿 189 链接（已解锁的话有，未解锁的话没有）
-        let link = '', code = '', isUnlocked = false;
-        try {
-          const cloud189 = await client.getCloud189Links(r.slug);
-          if (cloud189.url) {
-            link = cloud189.url;
-            code = cloud189.accessCode || '';
-            isUnlocked = true;
-          }
-        } catch {}
-
-        enriched.push({
-          id: r.slug,
-          slug: r.slug,
-          title: r.text?.split('\n')[0]?.slice(0, 100) || '未命名资源',
-          size: d.share_size || 0,
-          sizeFormatted: formatSize(d.share_size || 0),
-          points: d.default_unlock_points ?? null,
-          isFree: d.default_unlock_points === 0,
-          link,
-          code,
-          isUnlocked,
-          cloudType: 'cloud189',
-          // 额外字段
-          source: 'bridge',
-          movieId: tmdbId,
-          movieType: type
-        });
+        info = await client.getResourceUnlockInfo(r);
       } catch (e) {
-        enriched.push({
-          id: r.slug,
-          slug: r.slug,
-          title: r.text?.split('\n')[0]?.slice(0, 100) || '未命名资源',
-          cloudType: 'cloud189',
-          error: e.message.slice(0, 100)
-        });
+        infoError = e.message.slice(0, 100);
       }
+
+      // 尝试拿 189 链接（已解锁的话有，未解锁的话没有）
+      let link = '', code = '', isUnlocked = Boolean(r.is_unlocked);
+      try {
+        const cloud189 = await client.getCloud189Links(r.slug);
+        if (cloud189.url) {
+          link = cloud189.url;
+          code = cloud189.accessCode || '';
+          isUnlocked = true;
+        }
+      } catch {}
+
+      const points = info.default_unlock_points ?? info.unlock_points ?? r.unlock_points ?? null;
+      const size = info.share_size ?? r.share_size ?? 0;
+      const item = {
+        id: r.slug,
+        slug: r.slug,
+        title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
+        size,
+        sizeFormatted: formatSize(size),
+        points,
+        isFree: points === 0,
+        link,
+        code,
+        isUnlocked,
+        cloudType: 'cloud189',
+        // 额外字段
+        source: info.source || r.source || 'bridge',
+        movieId: tmdbId,
+        movieType: type
+      };
+      if (infoError && points === null) item.error = infoError;
+      enriched.push(item);
     }
 
     return {
@@ -685,7 +631,8 @@ app.get('/hdhive/public/bulletins/latest', async (req, res) => {
 // ⚠️ 此接口会实际登录影巢账号，建议只在 cookie 过期时调用
 app.post('/hdhive/login', async (req, res) => {
   const r = await withTimeout('login', async () => {
-    const { username, password } = req.body || {};
+    const username = req.body?.username || config.defaultUsername;
+    const password = req.body?.password || config.defaultPassword;
     if (!username || !password) {
       throw new Error('username and password are required');
     }
@@ -770,6 +717,8 @@ app.post('/hdhive/login', async (req, res) => {
 
       return {
         cookie: cookieHeader,
+        cookieHeader,
+        cookieNames: cookies.map(c => c.name),
         cookies: cookies.map(c => ({
           name: c.name,
           value: c.value,
@@ -779,6 +728,7 @@ app.post('/hdhive/login', async (req, res) => {
           secure: c.secure
         })),
         user: userInfo,
+        currentUser: userInfo,
         persisted: dbSaved,
         key: saveKey,
         note: dbSaved?.saved
@@ -803,6 +753,8 @@ app.get('/hdhive/cookies', async (req, res) => {
     const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
     return {
       cookie: cookieHeader,
+      cookieHeader,
+      cookieNames: cookies.map(c => c.name),
       cookies: cookies.map(c => ({
         name: c.name,
         value: c.value,
@@ -896,23 +848,26 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
     // 找资源列表
     const resources = await client.findResourcesFromMoviePage(resolved.url);
 
-    // 对每个资源查需要的积分（不消耗）
+    // 对每个资源查需要的积分（优先 DOM，checkResource 兜底；不消耗）
     const enriched = [];
     for (const r of resources) {
       try {
-        const check = await client.checkResource(`${config.baseUrl}/resource/189/${r.slug}`);
+        const info = await client.getResourceUnlockInfo(r);
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: r.text.split('\n')[0]?.slice(0, 60),
-          unlock_points: check.data?.data?.default_unlock_points ?? null,
-          website: check.data?.data?.website
+          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+          unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
+          website: info.website,
+          share_size: info.share_size ?? r.share_size ?? 0,
+          is_free: info.is_free ?? r.is_free ?? false,
+          source: info.source
         });
       } catch (e) {
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: r.text.split('\n')[0]?.slice(0, 60),
+          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
           unlock_points: null,
           error: e.message.slice(0, 100)
         });

@@ -284,6 +284,53 @@ export class HdhiveClient {
     return this.call('POST', '/api/customer/check/resource', { body: { url } });
   }
 
+  async getResourceUnlockInfo(resourceOrSlug) {
+    const resource = typeof resourceOrSlug === 'object' && resourceOrSlug
+      ? resourceOrSlug
+      : { slug: String(resourceOrSlug || '') };
+    const pageUrl = resource.url || resource.pageUrl || resource.page_url || '';
+    const slug = resource.slug
+      || resource.id
+      || String(pageUrl).match(/\/resource\/(?:189|cloud189|8)\/([A-Za-z0-9._~-]+)/)?.[1]
+      || '';
+    const fallbackUrl = pageUrl || (slug ? `${this.baseUrl}/resource/189/${slug}` : '');
+    const pointValue = resource.unlock_points
+      ?? resource.default_unlock_points
+      ?? resource.points
+      ?? ((resource.is_free || resource.isFree) ? 0 : null);
+
+    if (pointValue !== null && pointValue !== undefined && Number.isFinite(Number(pointValue))) {
+      const points = Number(pointValue);
+      return {
+        slug,
+        website: resource.website || resource.pan_type || '189',
+        default_unlock_points: points,
+        unlock_points: points,
+        share_size: resource.share_size || resource.size || 0,
+        is_free: resource.is_free ?? resource.isFree ?? points === 0,
+        source: resource.source || 'dom'
+      };
+    }
+
+    if (!fallbackUrl) {
+      throw new Error('resource url is required');
+    }
+
+    const check = await this.checkResource(fallbackUrl);
+    const data = check.data?.data || {};
+    const points = data.default_unlock_points ?? data.unlock_points ?? null;
+    return {
+      ...data,
+      slug,
+      website: data.website || resource.website || resource.pan_type || '189',
+      default_unlock_points: points,
+      unlock_points: points,
+      share_size: data.share_size ?? resource.share_size ?? resource.size ?? 0,
+      is_free: data.is_free ?? resource.is_free ?? resource.isFree ?? points === 0,
+      source: 'check-resource'
+    };
+  }
+
   async getPlaylists(query = {}) {
     return this.call('GET', '/api/customer/playlists/my', { query });
   }
@@ -308,23 +355,26 @@ export class HdhiveClient {
     // 2. 找资源列表
     const resources = await this.findResourcesFromMoviePage(resolved.url);
 
-    // 3. 对每个资源查询所需积分（checkResource 不消耗积分）
+    // 3. 对每个资源查询所需积分（优先 DOM，checkResource 兜底；不消耗积分）
     const enriched = [];
     for (const r of resources) {
       try {
-        const check = await this.checkResource(`${this.baseUrl}/resource/189/${r.slug}`);
+        const info = await this.getResourceUnlockInfo(r);
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: r.text.split('\n')[0]?.slice(0, 60),
-          unlock_points: check.data?.data?.default_unlock_points ?? null,
-          website: check.data?.data?.website
+          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+          unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
+          website: info.website,
+          share_size: info.share_size ?? r.share_size ?? 0,
+          is_free: info.is_free ?? r.is_free ?? false,
+          source: info.source
         });
       } catch (e) {
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: r.text.split('\n')[0]?.slice(0, 60),
+          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
           unlock_points: null,
           error: e.message.slice(0, 100)
         });
@@ -441,14 +491,99 @@ export class HdhiveClient {
     // 不需要等太久，立即读 DOM
     await this._page.waitForTimeout(500);
 
-    const slugs = await this._page.evaluate(() => {
-      const anchors = [...document.querySelectorAll('a[href*="/resource/189/"]')];
-      return anchors.map(a => {
-        const m = a.href.match(/\/resource\/189\/([a-f0-9]{32})/);
-        return m ? { slug: m[1], url: a.href, text: a.innerText?.slice(0, 100) } : null;
-      }).filter(Boolean);
+    const resources = await this._page.evaluate(() => {
+      const parseSize = (value) => {
+        const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)/i);
+        if (!match) return 0;
+        const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+        return Math.round(Number(match[1]) * units[match[2].toUpperCase()]);
+      };
+      const parseTitle = (lines) => {
+        const cleanTitle = (line) => String(line || '').replace(/^免费\s*/, '').trim();
+        const pointsIndex = lines.findIndex((line) => /免费|\d+\s*积分/.test(line));
+        const startIndex = pointsIndex >= 0 ? pointsIndex + 1 : 0;
+        const skipPattern = /^(发布于|免费|\d+\s*积分|疑似失效|加入片单|4K|1080P|720P|简中|简英双语|内封|外挂|WEB-DL\/WEBRip|蓝光原盘\/REMUX|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B))$/i;
+        const title = lines.slice(startIndex).find((line) => line.length > 3 && !skipPattern.test(line))
+          || lines.find((line) => line.length > 3 && !skipPattern.test(line));
+        return cleanTitle(title) || '影巢天翼资源';
+      };
+      const resourceSlugFromAnchor = (anchor) => {
+        try {
+          const href = new URL(anchor.href, location.href);
+          const parts = href.pathname.split('/').filter(Boolean);
+          return decodeURIComponent(parts[2] || '');
+        } catch {
+          return '';
+        }
+      };
+      const resourceSlugsIn = (node) => [...new Set(Array.from(node.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'))
+        .map(resourceSlugFromAnchor)
+        .filter(Boolean))];
+      const findResourceCard = (anchor, slug) => {
+        let card = anchor;
+        let best = anchor;
+        for (let index = 0; index < 8 && card?.parentElement; index += 1) {
+          const parent = card.parentElement;
+          const slugs = resourceSlugsIn(parent);
+          if (slugs.length > 1 || (slugs.length === 1 && slugs[0] !== slug)) break;
+          const text = (parent.innerText || '').trim();
+          if (/发布于|积分|免费|疑似失效|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B)/i.test(text)) {
+            best = parent;
+          }
+          card = parent;
+        }
+        return best;
+      };
+      const parseResource = (anchor) => {
+        const href = new URL(anchor.href, location.href);
+        const parts = href.pathname.split('/').filter(Boolean);
+        const slug = decodeURIComponent(parts[2] || '');
+        if (!slug) return null;
+
+        const card = findResourceCard(anchor, slug);
+        const text = (card?.innerText || anchor.innerText || anchor.textContent || '').trim();
+        const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        const pointsMatch = text.match(/(\d+)\s*积分/);
+        const isFree = /(^|\n|\s)免费($|\n|\s)/.test(text)
+          || lines.some((line) => line === '免费')
+          || (!pointsMatch && /^免费/.test(text));
+        const unlockPoints = pointsMatch ? Number(pointsMatch[1]) : (isFree ? 0 : null);
+        const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
+        const accessCode = (text.match(/(?:访问码|提取码)[：:\s]*([A-Za-z0-9]{4})/) || [])[1] || '';
+
+        return {
+          id: slug,
+          slug,
+          url: href.href,
+          pageUrl: href.href,
+          text: text.slice(0, 1000),
+          title: parseTitle(lines),
+          pan_type: '189',
+          website: '189',
+          share_size: parseSize(text),
+          unlock_points: unlockPoints,
+          default_unlock_points: unlockPoints,
+          is_free: isFree || unlockPoints === 0,
+          expired: /疑似失效/.test(text),
+          is_unlocked: /已解锁|查看链接|复制链接/.test(text) || Boolean(cloudLink),
+          media_url: cloudLink?.[0] || '',
+          access_code: accessCode,
+          source: 'dom'
+        };
+      };
+
+      const anchors = [...document.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]')];
+      const seen = new Set();
+      const result = [];
+      for (const anchor of anchors) {
+        const resource = parseResource(anchor);
+        if (!resource || seen.has(resource.slug)) continue;
+        seen.add(resource.slug);
+        result.push(resource);
+      }
+      return result;
     });
-    return slugs;
+    return resources;
   }
 
   /**
