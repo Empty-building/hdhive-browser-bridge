@@ -69,8 +69,17 @@ const logs = await client.get('/api/customer/points-logs', { page: 1, page_size:
 // 未读消息
 const unread = await client.get('/api/customer/messages/unread-count');
 
-// 签到
-const checkin = await client.post('/api/customer/user/checkin');
+// 签到（推荐：返回已归一化的签到状态和积分变化）
+const checkin = await client.checkin();
+console.log(checkin.message, checkin.pointsDelta);
+
+// 自动处理 space_captcha（需要配置 CAPTCHA_AI_* 或构造参数）
+const checked = await client.checkin({
+  autoVerify: true,
+  verificationSolver: 'ai',
+  verificationAttempts: 3
+});
+console.log(checked.checkedIn, checked.alreadyCheckedIn);
 
 // 订阅检查
 const sub = await client.get('/api/customer/subscriptions/check', {
@@ -100,7 +109,7 @@ await client.close();
 | 接口 | 方法 | 验证状态 |
 |------|------|----------|
 | `/api/customer/user/current` | GET | ✅ 成功 |
-| `/api/customer/user/checkin` | POST | ✅ |
+| `/api/customer/user/checkin` | POST | ✅，验证码环境可通过 `checkin({ autoVerify: true })` 处理 |
 | `/api/customer/points-logs` | GET | ✅ 成功 |
 | `/api/customer/messages/unread-count` | GET | ✅ 成功 |
 | `/api/customer/subscriptions/check` | GET | ✅ 成功 |

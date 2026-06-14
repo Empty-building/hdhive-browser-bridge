@@ -75,6 +75,10 @@ docker-compose logs -f hdhive-api
 | `BROWSER_HEADLESS` | ❌ | `true` | 是否无头模式（调试可设 `false`）|
 | `ACTION_TIMEOUT_MS` | ❌ | `180000` | 单个接口超时（毫秒）|
 | `AUTO_WARMUP` | ❌ | `true` | 启动时自动预热浏览器 |
+| `CAPTCHA_AI_BASE_URL` | ❌ | 空 | 自动签到验证码 AI endpoint，例如 `https://cpar.114514heihei.eu.org/v1` |
+| `CAPTCHA_AI_API_KEY` | ❌ | 空 | 自动签到验证码 AI key。只用于验证码图片识别，不会发送 Cookie |
+| `CAPTCHA_AI_MODEL` | ❌ | `web2api/gemini-auto` | 自动签到验证码模型 |
+| `CAPTCHA_SOLVER` | ❌ | 空 | 默认验证码求解器，可设 `ai`、`auto` 或 `heuristic` |
 | `PORT` | ❌ | `10000` | HTTP 端口 |
 | `DATABASE_URL` | ❌ | 空 | Postgres 连接串。**设置后启用 cookie 持久化** |
 | `BRIDGE_STATE_SECRET` | ❌ | `BRIDGE_TOKEN` | 加密密钥（用于数据库存储 cookie）|
@@ -337,11 +341,32 @@ curl -H "x-bridge-token: xxx" http://localhost:10000/hdhive/customer/current
 积分日志。
 
 #### `POST /hdhive/customer/checkin`
-签到。
+签到。默认返回归一化状态和签到前后积分；如需跳过额外用户信息查询，可追加 `?includeUser=false`。如果当前环境要求验证码，可追加 `?autoVerify=true&verificationSolver=ai`，并配置 `CAPTCHA_AI_BASE_URL` 与 `CAPTCHA_AI_API_KEY`。
 
 ```bash
 curl -X POST -H "x-bridge-token: xxx" http://localhost:10000/hdhive/customer/checkin
+
+curl -X POST -H "x-bridge-token: xxx" \
+  "http://localhost:10000/hdhive/customer/checkin?autoVerify=true&verificationSolver=ai&verificationAttempts=3"
 ```
+
+返回的 `data` 中包含：
+
+```json
+{
+  "success": true,
+  "checkedIn": true,
+  "alreadyCheckedIn": false,
+  "requiresVerification": false,
+  "challenge": null,
+  "message": "签到成功",
+  "previousPoints": 100,
+  "currentPoints": 101,
+  "pointsDelta": 1
+}
+```
+
+如果触发验证码且未启用自动验证，`data.success` 为 `false`，并返回 `requiresVerification: true`、`challengeTicket`、`challengeType`、`captchaMode` 和完整 `challenge` 对象。启用自动验证后，验证码通过会调用官方 `checkIn` server action 完成签到；已签到时返回 `alreadyCheckedIn: true`。
 
 #### `GET /hdhive/customer/messages/unread-count`
 未读消息数。
@@ -549,7 +574,7 @@ for (const tmdbId of [372058, 550, 129]) {
 - `GET /hdhive/customer/current`
 - `GET /hdhive/customer/points-logs`
 - `GET /hdhive/customer/messages/unread-count`
-- **`POST /hdhive/customer/checkin`（增加积分！）**
+- **`POST /hdhive/customer/checkin`（增加积分；可用 `autoVerify=true` 自动处理验证码）**
 - `GET /hdhive/customer/playlists/my`
 - `POST /hdhive/customer/subscriptions/check`
 - `POST /hdhive/customer/check/resource`
