@@ -157,12 +157,13 @@ export class HdhiveClient {
     this._page = null;
     this._ready = false;
     this._hookRegistered = false;
+    this._pageNeedsMovieReload = false;
   }
 
   /**
    * 创建一个持久化浏览器实例（注入 cookie）
    */
-  async _ensureBrowser({ injectCookie = true } = {}) {
+  async _ensureBrowser({ injectCookie = true, initialUrl = this.baseUrl } = {}) {
     if (this._ready && this._page) return;
     const profileDir = path.join(os.tmpdir(), `hdhive-api-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     fs.mkdirSync(profileDir, { recursive: true });
@@ -206,9 +207,12 @@ export class HdhiveClient {
     }
 
     this._page = await this._context.pages()[0] || await this._context.newPage();
-    await this._page.goto(`${this.baseUrl}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await this._page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
-    await this._page.waitForTimeout(2000);
+    const targetUrl = initialUrl || this.baseUrl;
+    await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await this._page.waitForFunction(
+      () => document.readyState !== 'loading',
+      { timeout: 5000 }
+    ).catch(() => undefined);
     this._ready = true;
   }
 
@@ -220,6 +224,33 @@ export class HdhiveClient {
       await this._page.waitForTimeout(2000);
       this._hookRegistered = false;
     } catch (e) {}
+  }
+
+  async _waitForMoviePageReady(timeoutMs = 12000) {
+    const start = Date.now();
+    let lastLength = 0;
+    let stableCount = 0;
+    while (Date.now() - start < timeoutMs) {
+      const state = await this._page.evaluate(() => {
+        const text = document.body?.innerText || '';
+        const hasResource = Boolean(document.querySelector('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]'));
+        return {
+          length: text.length,
+          loading: text.includes('LOADING'),
+          hasResource
+        };
+      }).catch(() => ({ length: 0, loading: true, hasResource: false }));
+
+      if (state.hasResource) return true;
+      if (!state.loading && state.length > 100) {
+        if (Math.abs(state.length - lastLength) < 20) stableCount += 1;
+        else stableCount = 0;
+        if (stableCount >= 2) return true;
+      }
+      lastLength = state.length;
+      await this._page.waitForTimeout(250);
+    }
+    return false;
   }
 
   async call(method, path, { query, body } = {}) {
@@ -297,7 +328,7 @@ export class HdhiveClient {
     const pointValue = resource.unlock_points
       ?? resource.default_unlock_points
       ?? resource.points
-      ?? ((resource.is_free || resource.isFree) ? 0 : null);
+      ?? ((resource.is_free || resource.isFree || resource.is_unlocked || resource.isUnlocked || resource.media_url || resource.link) ? 0 : null);
 
     if (pointValue !== null && pointValue !== undefined && Number.isFinite(Number(pointValue))) {
       const points = Number(pointValue);
@@ -406,6 +437,18 @@ export class HdhiveClient {
    * 拦截第一次重定向（/tmdb/movie/{id} → /movie/{内部slug}）就停止
    */
   async resolveTmdbToInternal(tmdbId, type = 'movie', attempt = 1) {
+    if (this._ready && this._page) {
+      try {
+        return await this._resolveTmdbInPage(this._page, tmdbId, type);
+      } catch (e) {
+        if (attempt < 2) {
+          await this._reloadPage();
+          return this.resolveTmdbToInternal(tmdbId, type, attempt + 1);
+        }
+        throw e;
+      }
+    }
+
     const profileDir = path.join(os.tmpdir(), `hdhive-resolve-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     fs.mkdirSync(profileDir, { recursive: true });
     const ctx = await chromium.launchPersistentContext(profileDir, {
@@ -419,17 +462,6 @@ export class HdhiveClient {
     });
     await ctx.addInitScript(STEALTH_SCRIPT);
     const page = await ctx.pages()[0] || await ctx.newPage();
-    let resolvedSlug = null;
-    let resolvedType = null;
-    const capture = (url) => {
-      if (resolvedSlug) return;
-      const m = String(url).match(/\/(movie|tv)\/([a-f0-9]{32})/);
-      if (m) { resolvedSlug = m[2]; resolvedType = m[1]; }
-    };
-    page.on('request', (req) => capture(req.url()));
-    page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) capture(frame.url()); });
-    page.on('response', (res) => capture(res.url()));
-
     // 拦截图片/统计加速
     await ctx.route('**/*', (route) => {
       const url = route.request().url();
@@ -440,24 +472,60 @@ export class HdhiveClient {
     });
 
     try {
+      return await this._resolveTmdbInPage(page, tmdbId, type);
+    } finally {
+      await ctx.close().catch(() => {});
+    }
+  }
+
+  async _resolveTmdbInPage(page, tmdbId, type = 'movie') {
+    let resolvedSlug = null;
+    let resolvedType = null;
+    const capture = (url) => {
+      if (resolvedSlug) return;
+      const m = String(url).match(/\/(movie|tv)\/([a-f0-9]{32})/);
+      if (m) { resolvedSlug = m[2]; resolvedType = m[1]; }
+    };
+    const onRequest = (req) => {
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) capture(req.url());
+    };
+    const onResponse = (res) => {
+      const req = res.request();
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) capture(res.url());
+    };
+    const onFrameNavigated = (frame) => {
+      if (frame === page.mainFrame()) capture(frame.url());
+    };
+
+    page.on('request', onRequest);
+    page.on('response', onResponse);
+    page.on('framenavigated', onFrameNavigated);
+    try {
       const tmdbUrl = `${this.baseUrl}/tmdb/${type}/${tmdbId}`;
+      if (/\/(movie|tv)\/[a-f0-9]{32}/.test(page.url())) {
+        await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 3000 }).catch(() => {});
+      }
       const navPromise = page.goto(tmdbUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       const start = Date.now();
       while (!resolvedSlug && Date.now() - start < 8000) {
         await page.waitForTimeout(50);
       }
-      try { await ctx.route('**/*', route => route.abort()); } catch {}
+      if (resolvedSlug) {
+        await page.evaluate(() => window.stop()).catch(() => {});
+        if (page === this._page) this._pageNeedsMovieReload = true;
+        return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
+      }
+
       await navPromise.catch(() => {});
+      capture(page.url());
       if (!resolvedSlug) {
-        await ctx.close().catch(() => {});
-        if (attempt < 2) {
-          return this.resolveTmdbToInternal(tmdbId, type, attempt + 1);
-        }
         throw new Error(`cannot resolve TMDB ${type}/${tmdbId}`);
       }
       return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
     } finally {
-      await ctx.close().catch(() => {});
+      page.off('request', onRequest);
+      page.off('response', onResponse);
+      page.off('framenavigated', onFrameNavigated);
     }
   }
 
@@ -466,20 +534,14 @@ export class HdhiveClient {
    * 优化：只滚动 2 次（之前 6 次），因为我们只要 slug
    */
   async findResourcesFromMoviePage(movieInternalUrl) {
-    await this._ensureBrowser();
-    try { await this._page.goto(movieInternalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    await this._ensureBrowser({ initialUrl: movieInternalUrl });
+    if (this._pageNeedsMovieReload || this._page.url() !== movieInternalUrl) {
+      this._pageNeedsMovieReload = false;
+      try { await this._page.goto(movieInternalUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }); } catch {}
+    }
 
     // 轮询等待 LOADING 状态结束（页面 client-side 渲染完成）
-    const start = Date.now();
-    let loaded = false;
-    while (Date.now() - start < 15000) {
-      loaded = await this._page.evaluate(() => {
-        const text = document.body?.innerText || '';
-        return text && !text.includes('LOADING') && text.length > 100;
-      });
-      if (loaded) break;
-      await this._page.waitForTimeout(300);
-    }
+    const loaded = await this._waitForMoviePageReady();
     if (!loaded) console.warn('[hdhive-client] movie 页面加载超时');
 
     // 点击"天翼云盘" tab —— 一旦点击，资源列表立即出现在 DOM 中
@@ -488,8 +550,18 @@ export class HdhiveClient {
       const target = candidates.find(el => /天翼云盘|189/.test(el.innerText || ''));
       if (target) target.click();
     }).catch(() => {});
-    // 不需要等太久，立即读 DOM
-    await this._page.waitForTimeout(500);
+    await this._page.waitForFunction(
+      () => Boolean(document.querySelector('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]')),
+      { timeout: 1200 }
+    ).catch(() => undefined);
+    await this._page.waitForFunction(
+      () => {
+        const anchors = document.querySelectorAll('a[href*="/resource/189/"],a[href*="/resource/cloud189/"],a[href*="/resource/8/"]');
+        const text = document.body?.innerText || '';
+        return anchors.length > 0 && /积分|免费/.test(text);
+      },
+      { timeout: 2500 }
+    ).catch(() => undefined);
 
     const resources = await this._page.evaluate(() => {
       const parseSize = (value) => {
