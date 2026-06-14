@@ -147,6 +147,176 @@ const RSC_INTERCEPTOR_SCRIPT = `
 // 导出 stealth 脚本供 server.mjs 复用
 export { STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT };
 
+function readNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === '') continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function getResponseMessage(response) {
+  const data = response?.data;
+  if (typeof data === 'string') return data;
+  const message = data?.message || data?.error || data?.msg || '';
+  const description = data?.description || '';
+  if (description && /签到失败|操作失败|失败|failed/i.test(String(message))) return description;
+  return message || description;
+}
+
+function isAlreadyCheckedInMessage(message) {
+  return /已签到|已经签到|今日已|重复签到|already\s*(checked\s*in|check.?in)|checked\s*in/i.test(String(message || ''));
+}
+
+function isVerificationRequiredMessage(message) {
+  return /验证码|验证|captcha|verification/i.test(String(message || ''));
+}
+
+function getCheckinChallenge(response) {
+  const data = response?.data?.data;
+  if (!data || typeof data !== 'object') return null;
+  if (!data.challenge_ticket && !data.challenge_type && !data.captcha_mode) return null;
+  return {
+    ticket: data.challenge_ticket || null,
+    type: data.challenge_type || null,
+    captchaMode: data.captcha_mode || null,
+    action: data.challenge_action || null,
+    reason: data.challenge_reason || null,
+    expiresInSeconds: readNumber(data.expires_in_seconds)
+  };
+}
+
+function getCurrentUserPoints(response) {
+  const data = response?.data?.data || response?.data || {};
+  return readNumber(
+    data?.user_meta?.points,
+    data?.userMeta?.points,
+    data?.points,
+    data?.user?.user_meta?.points,
+    data?.user?.points
+  );
+}
+
+function parseSpaceCaptchaPrompt(prompt) {
+  const text = String(prompt || '');
+  const colorRules = [
+    ['orange', /橙|橘|orange/i],
+    ['yellow', /黄|yellow/i],
+    ['green', /绿|green/i],
+    ['blue', /蓝|青|blue|cyan/i],
+    ['purple', /紫|purple/i],
+    ['pink', /粉|pink/i],
+    ['red', /红|red/i]
+  ];
+  const color = colorRules.find(([, pattern]) => pattern.test(text))?.[0] || null;
+  const size = /小|较小|小体积|small/i.test(text)
+    ? 'small'
+    : (/大|较大|大体积|large/i.test(text) ? 'large' : null);
+  return { text, color, size };
+}
+
+function getSpaceCaptchaPayload(response) {
+  const data = response?.data?.data || response?.data || {};
+  return {
+    token: data?.token || null,
+    mode: data?.mode || null,
+    backgroundImage: data?.background_image || data?.backgroundImage || null,
+    imageWidth: readNumber(data?.image_width, data?.imageWidth, data?.bg_image_width),
+    imageHeight: readNumber(data?.image_height, data?.imageHeight, data?.bg_image_height),
+    prompt: data?.click_prompt || data?.prompt || data?.tip || data?.message || ''
+  };
+}
+
+function isCaptchaVerifySuccess(response) {
+  const body = response?.data;
+  const data = body?.data;
+  if (data && typeof data === 'object' && 'success' in data) {
+    return data.success === true;
+  }
+  return body?.success === true && !body?.error_code;
+}
+
+function getCaptchaVerifyMessage(response) {
+  const body = response?.data;
+  return body?.data?.message || body?.message || body?.description || body?.error || '';
+}
+
+function clampNumber(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(min, Math.min(max, number));
+}
+
+function parseJsonObjectFromText(text) {
+  const value = String(text || '').trim();
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {}
+
+  const fenced = value.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  if (fenced) {
+    try {
+      return JSON.parse(fenced.trim());
+    } catch {}
+  }
+
+  const objectText = value.match(/\{[\s\S]*\}/)?.[0];
+  if (objectText) {
+    try {
+      return JSON.parse(objectText);
+    } catch {}
+  }
+  return null;
+}
+
+function sanitizeCaptchaVerification(verification) {
+  if (!verification || typeof verification !== 'object') return verification;
+  return {
+    ...verification,
+    attempts: Array.isArray(verification.attempts)
+      ? verification.attempts.map((attempt) => {
+        const verifyData = attempt.verifyData && typeof attempt.verifyData === 'object'
+          ? {
+            ...attempt.verifyData,
+            verifyTokenReceived: Boolean(attempt.verifyData.verify_token)
+          }
+          : attempt.verifyData;
+        if (verifyData && typeof verifyData === 'object') {
+          delete verifyData.verify_token;
+        }
+        const sanitized = { ...attempt, verifyData };
+        delete sanitized.verifyToken;
+        return sanitized;
+      })
+      : verification.attempts
+  };
+}
+
+function normalizeCheckinResult(response) {
+  const message = getResponseMessage(response);
+  const description = response?.data?.description || response?.data?.data?.description || '';
+  const alreadyCheckedIn = isAlreadyCheckedInMessage(`${message} ${description}`);
+  const challenge = getCheckinChallenge(response);
+  const requiresVerification = Boolean(challenge) || isVerificationRequiredMessage(message);
+  const body = response?.data;
+  const bodyFailed = Boolean(body && typeof body === 'object' && body.success === false);
+  const checkedIn = Boolean(response?.ok) && !bodyFailed && !alreadyCheckedIn;
+
+  return {
+    success: checkedIn || alreadyCheckedIn,
+    checkedIn,
+    alreadyCheckedIn,
+    requiresVerification,
+    challenge,
+    challengeTicket: challenge?.ticket || null,
+    challengeType: challenge?.type || null,
+    captchaMode: challenge?.captchaMode || null,
+    message
+  };
+}
+
 export class HdhiveClient {
   constructor(options = {}) {
     this.baseUrl = (options.baseUrl || DEFAULT_BASE).replace(/\/$/, '');
@@ -158,6 +328,10 @@ export class HdhiveClient {
     this._ready = false;
     this._hookRegistered = false;
     this._pageNeedsMovieReload = false;
+    this.captchaAiBaseUrl = String(options.captchaAiBaseUrl || process.env.CAPTCHA_AI_BASE_URL || '').replace(/\/$/, '');
+    this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
+    this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
+    this.captchaSolver = String(options.captchaSolver || process.env.CAPTCHA_SOLVER || '').toLowerCase();
   }
 
   /**
@@ -277,6 +451,864 @@ export class HdhiveClient {
     }
   }
 
+  async _browserFetchJson(path, { method = 'GET', body, query } = {}) {
+    await this._ensureBrowser();
+    let url = /^https?:\/\//i.test(path)
+      ? path
+      : `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+    if (query) {
+      const qs = new URLSearchParams();
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== null) qs.set(key, String(value));
+      }
+      const suffix = qs.toString();
+      if (suffix) url += (url.includes('?') ? '&' : '?') + suffix;
+    }
+
+    return this._page.evaluate(async ({ url, method, body }) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      const init = {
+        method: String(method || 'GET').toUpperCase(),
+        credentials: 'include',
+        headers: {},
+        signal: controller.signal
+      };
+      if (body !== undefined && body !== null) {
+        init.body = typeof body === 'string' ? body : JSON.stringify(body);
+        init.headers['content-type'] = 'application/json';
+      }
+      try {
+        const res = await fetch(url, init);
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = text; }
+        return { status: res.status, ok: res.ok, data };
+      } finally {
+        clearTimeout(timeout);
+      }
+    }, { url, method, body: body == null ? null : body });
+  }
+
+  async _locateSpaceCaptchaTarget(captcha) {
+    const prompt = parseSpaceCaptchaPrompt(captcha.prompt);
+    if (!captcha.backgroundImage) {
+      throw new Error('captcha background image is missing');
+    }
+
+    const result = await this._page.evaluate(async ({ image, prompt }) => {
+      const colorMatchers = [
+        { name: 'purple', patterns: [/purple/i, /紫/] },
+        { name: 'cyan', patterns: [/cyan/i, /青/] },
+        { name: 'orange', patterns: [/orange/i, /橙|橘/] },
+        { name: 'yellow', patterns: [/yellow/i, /黄/] },
+        { name: 'green', patterns: [/green/i, /绿/] },
+        { name: 'blue', patterns: [/blue/i, /蓝/] },
+        { name: 'gray', patterns: [/gr[ae]y/i, /灰/] },
+        { name: 'pink', patterns: [/pink/i, /粉/] },
+        { name: 'red', patterns: [/red/i, /红/] },
+        { name: 'black', patterns: [/black/i, /黑/] },
+        { name: 'white', patterns: [/white/i, /白/] }
+      ];
+      const shapeMatchers = [
+        { name: 'sphere', patterns: [/sphere/i, /球|球体|圆球/] },
+        { name: 'cube', patterns: [/cube|box/i, /立方|方块|盒/] },
+        { name: 'cylinder', patterns: [/cylinder/i, /圆柱/] },
+        { name: 'cone', patterns: [/cone/i, /圆锥/] },
+        { name: 'pyramid', patterns: [/pyramid/i, /金字塔|棱锥/] }
+      ];
+
+      const img = new Image();
+      img.decoding = 'async';
+      const loaded = new Promise((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('captcha image decode failed'));
+      });
+      img.src = image;
+      await loaded;
+
+      const width = img.naturalWidth || img.width;
+      const height = img.naturalHeight || img.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, width, height);
+      const pixels = ctx.getImageData(0, 0, width, height).data;
+      const total = width * height;
+
+      function getPixel(index) {
+        const offset = index * 4;
+        return [pixels[offset], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3]];
+      }
+
+      function luminance(r, g, b) {
+        return 0.299 * r + 0.587 * g + 0.114 * b;
+      }
+
+      function rgbToHsv(r, g, b) {
+        const rn = r / 255;
+        const gn = g / 255;
+        const bn = b / 255;
+        const max = Math.max(rn, gn, bn);
+        const min = Math.min(rn, gn, bn);
+        const delta = max - min;
+        let h = 0;
+        if (delta !== 0) {
+          if (max === rn) h = ((gn - bn) / delta) % 6;
+          else if (max === gn) h = (bn - rn) / delta + 2;
+          else h = (rn - gn) / delta + 4;
+          h *= 60;
+          if (h < 0) h += 360;
+        }
+        return {
+          h,
+          s: max === 0 ? 0 : delta / max,
+          v: max
+        };
+      }
+
+      function hueBetween(h, min, max) {
+        return min <= max ? h >= min && h <= max : h >= min || h <= max;
+      }
+
+      const borderSamples = [];
+      for (let x = 0; x < width; x += 8) {
+        borderSamples.push(getPixel(x));
+        borderSamples.push(getPixel((height - 1) * width + x));
+      }
+      for (let y = 0; y < height; y += 8) {
+        borderSamples.push(getPixel(y * width));
+        borderSamples.push(getPixel(y * width + width - 1));
+      }
+      const background = borderSamples.reduce((acc, pixel) => {
+        acc.r += pixel[0];
+        acc.g += pixel[1];
+        acc.b += pixel[2];
+        return acc;
+      }, { r: 0, g: 0, b: 0 });
+      background.r /= borderSamples.length || 1;
+      background.g /= borderSamples.length || 1;
+      background.b /= borderSamples.length || 1;
+      background.lum = luminance(background.r, background.g, background.b);
+
+      function colorDistanceFromBackground(r, g, b) {
+        return Math.hypot(r - background.r, g - background.g, b - background.b);
+      }
+
+      function matchesColor(color, r, g, b) {
+        const { h, s, v } = rgbToHsv(r, g, b);
+        const lum = luminance(r, g, b);
+        const bgDistance = colorDistanceFromBackground(r, g, b);
+        if (!color) return (s > 0.36 && v > 0.22) || bgDistance > 30;
+
+        switch (color) {
+          case 'red':
+            return s > 0.20 && v > 0.16 && ((hueBetween(h, 342, 18) && r > g * 1.12 && r > b * 1.08)
+              || (r > 130 && r > g * 1.35 && r > b * 1.25));
+          case 'orange':
+            return s > 0.22 && v > 0.18 && hueBetween(h, 16, 42) && r > 115 && g > 50 && r > b * 1.35;
+          case 'yellow':
+            return s > 0.18 && v > 0.25 && hueBetween(h, 38, 78) && r > 110 && g > 90 && b < 190;
+          case 'green':
+            return s > 0.20 && v > 0.16 && hueBetween(h, 78, 168) && g > 70 && g > b * 1.02;
+          case 'blue':
+            return s > 0.20 && v > 0.16 && hueBetween(h, 198, 252) && b > 65 && b > r * 1.05;
+          case 'cyan':
+            return s > 0.18 && v > 0.18 && hueBetween(h, 168, 202) && g > 80 && b > 80 && r < Math.max(g, b) * 0.88;
+          case 'purple':
+            return s > 0.18 && v > 0.16 && hueBetween(h, 254, 326) && b > 60 && r > 50;
+          case 'gray':
+            return s < 0.24 && bgDistance > 18 && lum > 45 && lum < 235 && Math.abs(r - g) < 36 && Math.abs(g - b) < 36;
+          case 'pink':
+            return s > 0.18 && v > 0.20 && (hueBetween(h, 318, 350) || hueBetween(h, 0, 10)) && r > 120 && b > 70;
+          case 'black':
+            return v < 0.24 && bgDistance > 30;
+          case 'white':
+            return s < 0.18 && v > 0.82 && bgDistance > 18;
+          default:
+            return (s > 0.36 && v > 0.22) || bgDistance > 30;
+        }
+      }
+
+      function makeColorMask(color) {
+        const mask = new Uint8Array(total);
+        for (let index = 0; index < total; index += 1) {
+          const offset = index * 4;
+          if (pixels[offset + 3] < 64) continue;
+          if (matchesColor(color, pixels[offset], pixels[offset + 1], pixels[offset + 2])) {
+            mask[index] = 1;
+          }
+        }
+        return mask;
+      }
+
+      function makeForegroundMask() {
+        const mask = new Uint8Array(total);
+        for (let index = 0; index < total; index += 1) {
+          const offset = index * 4;
+          const alpha = pixels[offset + 3];
+          if (alpha < 64) continue;
+          const r = pixels[offset];
+          const g = pixels[offset + 1];
+          const b = pixels[offset + 2];
+          const { s, v } = rgbToHsv(r, g, b);
+          const lum = luminance(r, g, b);
+          const bgDistance = colorDistanceFromBackground(r, g, b);
+          if ((s > 0.18 && v > 0.16) || bgDistance > 32 || (lum < background.lum - 26 && bgDistance > 18)) {
+            mask[index] = 1;
+          }
+        }
+        return mask;
+      }
+
+      function expandMask(mask, radius = 1) {
+        if (radius <= 0) return mask;
+        const expanded = new Uint8Array(total);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const index = y * width + x;
+            if (!mask[index]) continue;
+            for (let dy = -radius; dy <= radius; dy += 1) {
+              const yy = y + dy;
+              if (yy < 0 || yy >= height) continue;
+              for (let dx = -radius; dx <= radius; dx += 1) {
+                const xx = x + dx;
+                if (xx < 0 || xx >= width) continue;
+                expanded[yy * width + xx] = 1;
+              }
+            }
+          }
+        }
+        return expanded;
+      }
+
+      function componentsFromMask(mask, { radius = 1, minArea = 16 } = {}) {
+        const expanded = expandMask(mask, radius);
+        const visited = new Uint8Array(total);
+        const queue = new Int32Array(total);
+        const components = [];
+        const neighbors = [-width - 1, -width, -width + 1, -1, 1, width - 1, width, width + 1];
+
+        for (let start = 0; start < total; start += 1) {
+          if (!expanded[start] || visited[start]) continue;
+
+          let head = 0;
+          let tail = 0;
+          queue[tail++] = start;
+          visited[start] = 1;
+
+          let area = 0;
+          let expandedArea = 0;
+          let minX = width;
+          let minY = height;
+          let maxX = 0;
+          let maxY = 0;
+          let sumX = 0;
+          let sumY = 0;
+          let sumR = 0;
+          let sumG = 0;
+          let sumB = 0;
+          const colorHits = Object.fromEntries(colorMatchers.map(item => [item.name, 0]));
+
+          while (head < tail) {
+            const current = queue[head++];
+            const x = current % width;
+            const y = Math.floor(current / width);
+            expandedArea += 1;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+
+            if (mask[current]) {
+              const offset = current * 4;
+              const r = pixels[offset];
+              const g = pixels[offset + 1];
+              const b = pixels[offset + 2];
+              area += 1;
+              sumX += x;
+              sumY += y;
+              sumR += r;
+              sumG += g;
+              sumB += b;
+              for (const color of colorMatchers) {
+                if (matchesColor(color.name, r, g, b)) colorHits[color.name] += 1;
+              }
+            }
+
+            for (const step of neighbors) {
+              const next = current + step;
+              if (next < 0 || next >= total || visited[next] || !expanded[next]) continue;
+              const nx = next % width;
+              if (Math.abs(nx - x) > 1) continue;
+              visited[next] = 1;
+              queue[tail++] = next;
+            }
+          }
+
+          const boxWidth = maxX - minX + 1;
+          const boxHeight = maxY - minY + 1;
+          const boxArea = boxWidth * boxHeight;
+          if (area < minArea || boxWidth < 4 || boxHeight < 4 || boxArea > total * 0.55) continue;
+
+          const component = {
+            area,
+            expandedArea,
+            boxArea,
+            density: area / boxArea,
+            x: Math.round(sumX / area),
+            y: Math.round(sumY / area),
+            minX,
+            minY,
+            maxX,
+            maxY,
+            width: boxWidth,
+            height: boxHeight,
+            ratio: boxWidth / Math.max(1, boxHeight),
+            avgRgb: [
+              Math.round(sumR / area),
+              Math.round(sumG / area),
+              Math.round(sumB / area)
+            ],
+            colorHits
+          };
+          component.dominantColor = Object.entries(colorHits).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+          components.push(component);
+        }
+        return components
+          .filter(component => component.density >= 0.06)
+          .sort((a, b) => b.area - a.area);
+      }
+
+      const colorComponentCache = new Map();
+      function getColorComponents(color) {
+        if (!colorComponentCache.has(color)) {
+          colorComponentCache.set(color, componentsFromMask(makeColorMask(color), { radius: 1, minArea: color === 'gray' ? 20 : 16 }));
+        }
+        return colorComponentCache.get(color);
+      }
+
+      let allColorObjectsCache = null;
+      function getAllColorObjects() {
+        if (allColorObjectsCache) return allColorObjectsCache;
+        const objects = [];
+        for (const color of colorMatchers.map(item => item.name).filter(name => !['gray', 'black', 'white'].includes(name))) {
+          for (const component of getColorComponents(color)) {
+            const candidate = { ...component, source: `color:${color}` };
+            const existingIndex = objects.findIndex(item => sameComponent(item, candidate));
+            if (existingIndex >= 0) {
+              if (candidate.area > objects[existingIndex].area) objects[existingIndex] = candidate;
+            } else {
+              objects.push(candidate);
+            }
+          }
+        }
+        allColorObjectsCache = objects.sort((a, b) => b.area - a.area);
+        return allColorObjectsCache;
+      }
+
+      function findFirstMatch(text, matchers) {
+        const hits = [];
+        for (const item of matchers) {
+          for (const pattern of item.patterns) {
+            const match = text.match(pattern);
+            if (match && match.index !== undefined) {
+              hits.push({ name: item.name, index: match.index });
+            }
+          }
+        }
+        return hits.sort((a, b) => a.index - b.index)[0]?.name || null;
+      }
+
+      function parseDescriptor(value) {
+        const text = String(value || '').replace(/^请点击/, '').replace(/[，。,.!！]/g, '').replace(/物体|物品/g, '');
+        return {
+          text,
+          color: findFirstMatch(text, colorMatchers),
+          shape: findFirstMatch(text, shapeMatchers),
+          size: /小|小号|小型|小体积|小尺寸|small/i.test(text)
+            ? 'small'
+            : (/大|大号|大型|大体积|大尺寸|large/i.test(text) ? 'large' : null)
+        };
+      }
+
+      function parseTask(text) {
+        const cleaned = String(text || '').replace(/^请点击/, '').replace(/[，。,.!！]/g, '');
+        let match = cleaned.match(/与(.+?)有相同大小的(.+?)物[体品]?/);
+        if (match) {
+          return { type: 'sameSize', reference: parseDescriptor(match[1]), target: parseDescriptor(match[2]) };
+        }
+        match = cleaned.match(/与(.+?)有相同形状的(.*?)物[体品]?/);
+        if (match) {
+          return { type: 'sameShape', reference: parseDescriptor(match[1]), target: parseDescriptor(match[2]) };
+        }
+        match = cleaned.match(/与(.+?)有相同颜色的(.+)$/);
+        if (match) {
+          return { type: 'sameColor', reference: parseDescriptor(match[1]), target: parseDescriptor(match[2]) };
+        }
+        match = cleaned.match(/在(.+?)(右前方|左前方|右后方|左后方|右侧|左侧|前方|后方|上方|下方)(.+?)(?:物体|物品)?$/);
+        if (match) {
+          return { type: 'relative', reference: parseDescriptor(match[1]), relation: match[2], target: parseDescriptor(match[3]) };
+        }
+        return { type: 'simple', target: parseDescriptor(cleaned) };
+      }
+
+      const allObjects = componentsFromMask(makeForegroundMask(), { radius: 0, minArea: 28 });
+      function withObjectFallback(components, desc) {
+        if (!desc.color) return components;
+        if (components.length) return components;
+        return allObjects.filter(component => component.colorHits?.[desc.color] >= Math.max(12, component.area * 0.04));
+      }
+
+      function shapeScore(component, shape) {
+        if (!shape) return 0;
+        const ratio = component.ratio;
+        const density = component.density;
+        if (shape === 'sphere') return Math.abs(ratio - 1) + Math.abs(density - 0.68);
+        if (shape === 'cube') return Math.abs(ratio - 1) + Math.abs(density - 0.78);
+        if (shape === 'cylinder') return Math.abs(ratio - 0.82) + Math.abs(density - 0.70);
+        if (shape === 'cone' || shape === 'pyramid') return Math.abs(ratio - 0.78) + Math.abs(density - 0.52);
+        return 0;
+      }
+
+      function shapeDistance(a, b) {
+        return Math.abs(a.ratio - b.ratio)
+          + Math.abs(a.density - b.density) * 1.8
+          + Math.abs((a.width / Math.sqrt(a.area)) - (b.width / Math.sqrt(b.area))) * 0.35
+          + Math.abs((a.height / Math.sqrt(a.area)) - (b.height / Math.sqrt(b.area))) * 0.35;
+      }
+
+      function selectCandidates(desc) {
+        let candidates = desc.color
+          ? getColorComponents(desc.color).map(component => ({ ...component, source: `color:${desc.color}` }))
+          : getAllColorObjects();
+        if (!desc.color && !candidates.length) {
+          candidates = allObjects.map(component => ({ ...component, source: 'foreground' }));
+        }
+        candidates = withObjectFallback(candidates, desc);
+        if (!candidates.length) return [];
+
+        let filtered = candidates.filter(component =>
+          component.area >= 16
+          && component.boxArea <= total * 0.45
+          && component.minX > 2
+          && component.minY > 2
+          && component.maxX < width - 3
+          && component.maxY < height - 3
+        );
+        if (!filtered.length) filtered = candidates;
+
+        const largestArea = filtered.reduce((max, item) => Math.max(max, item.area), 0);
+        if (desc.size === 'small' && filtered.length > 1) {
+          const minArea = Math.max(16, largestArea * 0.025);
+          filtered = filtered.filter(component => component.area >= minArea).sort((a, b) => a.area - b.area);
+        } else if (desc.size === 'large') {
+          filtered = filtered.sort((a, b) => b.area - a.area);
+        } else if (desc.shape) {
+          filtered = filtered.sort((a, b) => shapeScore(a, desc.shape) - shapeScore(b, desc.shape));
+        } else {
+          filtered = filtered.sort((a, b) => b.area - a.area);
+        }
+        return filtered;
+      }
+
+      function selectOne(desc) {
+        return selectCandidates(desc)[0] || null;
+      }
+
+      function sameComponent(a, b) {
+        if (!a || !b) return false;
+        const centersClose = Math.hypot(a.x - b.x, a.y - b.y) < Math.max(a.width, a.height, b.width, b.height) * 0.35;
+        const boxesOverlap = !(a.maxX < b.minX || b.maxX < a.minX || a.maxY < b.minY || b.maxY < a.minY);
+        return centersClose && boxesOverlap;
+      }
+
+      function relationPenalty(candidate, reference, relation) {
+        const dx = candidate.x - reference.x;
+        const dy = candidate.y - reference.y;
+        let penalty = 0;
+        if (/右/.test(relation) && dx <= 0) penalty += Math.abs(dx) + 1000;
+        if (/左/.test(relation) && dx >= 0) penalty += Math.abs(dx) + 1000;
+        if (/前/.test(relation) && dy <= 0) penalty += Math.abs(dy) + 1000;
+        if (/后/.test(relation) && dy >= 0) penalty += Math.abs(dy) + 1000;
+        if (/上/.test(relation) && dy >= 0) penalty += Math.abs(dy) + 1000;
+        if (/下/.test(relation) && dy <= 0) penalty += Math.abs(dy) + 1000;
+        return penalty + Math.hypot(dx, dy) * 0.01;
+      }
+
+      const task = parseTask(prompt.text);
+      let chosen = null;
+      if (task.type === 'sameSize') {
+        const reference = selectOne(task.reference);
+        const candidates = selectCandidates(task.target).filter(candidate => !sameComponent(candidate, reference));
+        if (reference && candidates.length) {
+          chosen = candidates
+            .sort((a, b) => Math.abs(Math.log(a.area / reference.area)) - Math.abs(Math.log(b.area / reference.area)))[0];
+        }
+      } else if (task.type === 'sameShape') {
+        const reference = selectOne(task.reference);
+        const candidates = selectCandidates(task.target).filter(candidate => !sameComponent(candidate, reference));
+        if (reference && candidates.length) {
+          chosen = candidates
+            .sort((a, b) => shapeDistance(a, reference) - shapeDistance(b, reference))[0];
+        }
+      } else if (task.type === 'sameColor') {
+        const reference = selectOne(task.reference);
+        const referenceColor = reference?.source?.startsWith('color:')
+          ? reference.source.slice(6)
+          : reference?.dominantColor;
+        const target = {
+          ...task.target,
+          color: task.target.color || referenceColor || null
+        };
+        const candidates = selectCandidates(target).filter(candidate => !sameComponent(candidate, reference));
+        if (reference && candidates.length) {
+          chosen = candidates[0];
+        }
+      } else if (task.type === 'relative') {
+        const reference = selectOne(task.reference);
+        const candidates = selectCandidates(task.target).filter(candidate => !sameComponent(candidate, reference));
+        if (reference && candidates.length) {
+          chosen = candidates
+            .sort((a, b) => relationPenalty(a, reference, task.relation) - relationPenalty(b, reference, task.relation))[0];
+        }
+      } else {
+        chosen = selectOne(task.target);
+      }
+
+      if (!chosen) {
+        const fallbackDesc = parseDescriptor(prompt.text);
+        chosen = selectOne(fallbackDesc) || allObjects[0];
+      }
+      if (!chosen) {
+        throw new Error(`captcha target not found for prompt: ${prompt.text || 'unknown'}`);
+      }
+
+      function summarizeCandidate(component, index) {
+        return {
+          id: index + 1,
+          x: component.x,
+          y: component.y,
+          color: component.source?.startsWith('color:') ? component.source.slice(6) : component.dominantColor,
+          source: component.source || null,
+          area: component.area,
+          width: component.width,
+          height: component.height,
+          ratio: Number(component.ratio.toFixed(2)),
+          density: Number(component.density.toFixed(2))
+        };
+      }
+
+      const candidates = getAllColorObjects()
+        .filter(component =>
+          component.area >= 16
+          && component.boxArea <= total * 0.45
+          && component.minX > 2
+          && component.minY > 2
+          && component.maxX < width - 3
+          && component.maxY < height - 3
+        )
+        .slice(0, 16)
+        .map(summarizeCandidate);
+
+      return {
+        x: chosen.x,
+        y: chosen.y,
+        imageWidth: width,
+        imageHeight: height,
+        prompt: { ...prompt, task },
+        chosen,
+        components: (chosen.source?.startsWith('color:') ? getColorComponents(chosen.source.slice(6)) : allObjects).slice(0, 8),
+        objectCount: allObjects.length,
+        candidates
+      };
+    }, { image: captcha.backgroundImage, prompt });
+
+    return result;
+  }
+
+  async _locateSpaceCaptchaTargetWithAi(captcha) {
+    if (!this.captchaAiBaseUrl || !this.captchaAiApiKey) {
+      throw new Error('captcha AI solver is not configured');
+    }
+    if (!captcha.backgroundImage) {
+      throw new Error('captcha background image is missing');
+    }
+
+    const imageWidth = captcha.imageWidth || 344;
+    const imageHeight = captcha.imageHeight || 344;
+    const localAnalysis = await this._locateSpaceCaptchaTarget(captcha).catch((e) => ({
+      error: e.message,
+      candidates: []
+    }));
+    const candidates = Array.isArray(localAnalysis?.candidates) ? localAnalysis.candidates : [];
+    const gridImage = await this._page.evaluate(async ({ image, width, height }) => {
+      const img = new Image();
+      const loaded = new Promise((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('captcha image decode failed'));
+      });
+      img.src = image;
+      await loaded;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      ctx.save();
+      ctx.font = '12px sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= width; x += 50) {
+        ctx.strokeStyle = x === 0 ? 'rgba(255,0,0,0.8)' : 'rgba(255,0,0,0.32)';
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, height);
+        ctx.stroke();
+        ctx.fillStyle = 'rgba(255,0,0,0.9)';
+        ctx.fillText(String(x), Math.min(x + 2, width - 24), 2);
+      }
+      for (let y = 0; y <= height; y += 50) {
+        ctx.strokeStyle = y === 0 ? 'rgba(0,80,255,0.8)' : 'rgba(0,80,255,0.32)';
+        ctx.beginPath();
+        ctx.moveTo(0, y + 0.5);
+        ctx.lineTo(width, y + 0.5);
+        ctx.stroke();
+        ctx.fillStyle = 'rgba(0,80,255,0.9)';
+        ctx.fillText(String(y), 2, Math.min(y + 2, height - 14));
+      }
+      ctx.restore();
+      return canvas.toDataURL('image/jpeg', 0.92);
+    }, { image: captcha.backgroundImage, width: imageWidth, height: imageHeight });
+    const response = await fetch(`${this.captchaAiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.captchaAiApiKey}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: this.captchaAiModel,
+        temperature: 0,
+        max_tokens: 80,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: [
+                '你是验证码点击坐标识别器。',
+                `图片尺寸为 ${imageWidth}x${imageHeight} 像素，坐标原点在左上角。`,
+                `验证码提示：${captcha.prompt || '请点击目标物体。'}`,
+                '空间词约定：左/右对应图片 x 轴；后方/上方对应更小的 y；前方/下方对应更大的 y。',
+                '如果提示包含“相同颜色/形状/大小”，先定位参考物体，再点击满足条件的目标物体中心。',
+                candidates.length
+                  ? `本地图像分割得到的候选物体如下，优先从候选中选择目标：${JSON.stringify(candidates)}`
+                  : '没有可用候选物体，请直接根据图片估计目标中心。',
+                '第一张图是原图，第二张图带坐标网格；最终坐标仍按原图像素返回。',
+                '只返回严格 JSON：{"x":整数,"y":整数,"id":候选id或null}。',
+                '不要返回解释、Markdown 或额外字段。'
+              ].join('\n')
+            },
+            {
+              type: 'image_url',
+              image_url: { url: captcha.backgroundImage }
+            },
+            {
+              type: 'image_url',
+              image_url: { url: gridImage }
+            }
+          ]
+        }]
+      })
+    });
+    const body = await response.json().catch(async () => ({ error: await response.text().catch(() => '') }));
+    const content = body?.choices?.[0]?.message?.content || '';
+    const parsed = parseJsonObjectFromText(content);
+    const selectedCandidate = candidates.find(candidate => Number(candidate.id) === Number(parsed?.id));
+    const x = clampNumber(selectedCandidate?.x ?? parsed?.x, 0, imageWidth - 1);
+    const y = clampNumber(selectedCandidate?.y ?? parsed?.y, 0, imageHeight - 1);
+
+    if (x === null || y === null) {
+      throw new Error(`captcha AI solver returned invalid coordinates: ${String(content).slice(0, 120)}`);
+    }
+
+    return {
+      x: Math.round(x),
+      y: Math.round(y),
+      imageWidth,
+      imageHeight,
+      prompt: {
+        text: captcha.prompt || '',
+        solver: 'ai'
+      },
+      chosen: {
+        x: Math.round(x),
+        y: Math.round(y),
+        source: selectedCandidate ? `ai:candidate:${selectedCandidate.id}` : 'ai',
+        candidate: selectedCandidate || null
+      },
+      ai: {
+        model: body?.model || this.captchaAiModel,
+        status: response.status,
+        content: String(content).slice(0, 200),
+        localAnalysis: {
+          x: localAnalysis?.x,
+          y: localAnalysis?.y,
+          task: localAnalysis?.prompt?.task,
+          candidates
+        }
+      }
+    };
+  }
+
+  async _locateSpaceCaptchaTargetWithSolver(captcha, solver) {
+    const selected = String(solver || this.captchaSolver || 'heuristic').toLowerCase();
+    if (selected === 'ai') {
+      return this._locateSpaceCaptchaTargetWithAi(captcha);
+    }
+    if (selected === 'auto' && this.captchaAiBaseUrl && this.captchaAiApiKey) {
+      try {
+        return await this._locateSpaceCaptchaTargetWithAi(captcha);
+      } catch (e) {
+        const fallback = await this._locateSpaceCaptchaTarget(captcha);
+        return {
+          ...fallback,
+          aiError: e.message
+        };
+      }
+    }
+    return this._locateSpaceCaptchaTarget(captcha);
+  }
+
+  async _callCheckinServerAction({ verifyToken, isGambler = false } = {}) {
+    await this._ensureBrowser();
+    const actionId = '60529bb51b8032da8000e7c2d73b01e276a18422ea';
+    return this._page.evaluate(async ({ actionId, verifyToken, isGambler }) => {
+      let webpackRequire = window.__hdhiveRequire;
+      if (!webpackRequire) {
+        window.webpackChunk_N_E.push([['__hdhive_action_call__'], {}, (req) => {
+          webpackRequire = req;
+          window.__hdhiveRequire = req;
+        }]);
+      }
+      if (!webpackRequire.m['41607']) {
+        try { await webpackRequire.e(5530); } catch {}
+      }
+
+      const mod = webpackRequire(41607);
+      const action = mod.createServerReference(
+        actionId,
+        mod.callServer,
+        undefined,
+        mod.findSourceMapURL,
+        'checkIn'
+      );
+      const timeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('checkIn server action timed out')), 45000);
+      });
+
+      try {
+        const result = await Promise.race([action(Boolean(isGambler), verifyToken || undefined), timeout]);
+        const payload = result?.response || result?.error || result;
+        return {
+          status: result?.error ? 400 : 200,
+          ok: !result?.error,
+          data: payload
+        };
+      } catch (e) {
+        return {
+          status: 0,
+          ok: false,
+          data: {
+            success: false,
+            message: e.message || 'checkIn server action failed'
+          }
+        };
+      }
+    }, { actionId, verifyToken: verifyToken || null, isGambler });
+  }
+
+  async _solveSpaceCaptcha(challenge, options = {}) {
+    if (!challenge?.ticket) {
+      return { success: false, error: 'captcha challenge ticket is missing' };
+    }
+    const captchaMode = String(challenge.captchaMode || challenge.type || '');
+    if (captchaMode && !/space/i.test(captchaMode)) {
+      return { success: false, error: `unsupported captcha mode: ${captchaMode}` };
+    }
+
+    const attempts = Math.max(1, Math.min(5, Number(options.attempts || 3) || 3));
+    const results = [];
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const captchaResponse = await this._browserFetchJson('/captcha-api/slider', {
+        query: {
+          ticket: challenge.ticket,
+          _ts: Date.now()
+        }
+      });
+      const captcha = getSpaceCaptchaPayload(captchaResponse);
+      if (!captcha.token || !captcha.backgroundImage) {
+        results.push({
+          attempt,
+          success: false,
+          error: getResponseMessage(captchaResponse) || 'captcha payload is incomplete',
+          responseStatus: captchaResponse.status
+        });
+        await this._page.waitForTimeout(captchaResponse.status === 429 ? 2500 : 800);
+        continue;
+      }
+
+      const solution = await this._locateSpaceCaptchaTargetWithSolver(captcha, options.solver);
+      const verifyResponse = await this._browserFetchJson('/captcha-api/slider/verify', {
+        method: 'POST',
+        body: {
+          token: captcha.token,
+          x: solution.x,
+          y: solution.y,
+          bg_image_width: captcha.imageWidth || solution.imageWidth,
+          bg_image_height: captcha.imageHeight || solution.imageHeight,
+          challenge_ticket: challenge.ticket
+        }
+      });
+      const success = isCaptchaVerifySuccess(verifyResponse);
+      const verifyData = verifyResponse?.data?.data && typeof verifyResponse.data.data === 'object'
+        ? verifyResponse.data.data
+        : null;
+      const item = {
+        attempt,
+        success,
+        prompt: captcha.prompt,
+        mode: captcha.mode,
+        solution,
+        responseStatus: verifyResponse.status,
+        message: getCaptchaVerifyMessage(verifyResponse),
+        verifyData,
+        verifyToken: verifyData?.verify_token || null
+      };
+      results.push(item);
+      if (success) {
+        return {
+          success: true,
+          challengeTicket: challenge.ticket,
+          attempts: results,
+          prompt: captcha.prompt,
+          solution
+        };
+      }
+      await this._page.waitForTimeout(/频繁|too many|rate/i.test(item.message || '') ? 2500 : 1200);
+    }
+
+    const last = results[results.length - 1] || {};
+    return {
+      success: false,
+      challengeTicket: challenge.ticket,
+      attempts: results,
+      error: last.message || last.error || 'captcha verification failed'
+    };
+  }
+
   async createResource(url, movie_id = 1) {
     return this.call('POST', '/api/customer/resources', { body: { url, movie_id } });
   }
@@ -299,8 +1331,84 @@ export class HdhiveClient {
     return this.call('GET', '/api/customer/points-logs', { query });
   }
 
-  async checkin() {
-    return this.call('POST', '/api/customer/user/checkin');
+  async _getCurrentPointsSnapshot() {
+    try {
+      const response = await this.getCurrentUser();
+      return {
+        points: getCurrentUserPoints(response),
+        user: response?.data?.data || null
+      };
+    } catch (e) {
+      return { points: null, user: null, error: e.message };
+    }
+  }
+
+  async checkin(options = {}) {
+    const includeUser = options?.includeUser !== false;
+    const autoVerify = options?.autoVerify === true;
+    const before = includeUser ? await this._getCurrentPointsSnapshot() : null;
+    let response = await this.call('POST', '/api/customer/user/checkin');
+    let normalized = normalizeCheckinResult(response);
+    let initialCheckin = null;
+    let verification = null;
+
+    if (autoVerify && normalized.requiresVerification && normalized.challenge) {
+      initialCheckin = {
+        status: response.status,
+        ok: response.ok,
+        data: response.data,
+        ...normalized
+      };
+      verification = await this._solveSpaceCaptcha(normalized.challenge, {
+        attempts: options?.verificationAttempts,
+        solver: options?.verificationSolver
+      });
+      if (verification.success) {
+        const verifyToken = verification.attempts?.find(attempt => attempt.success)?.verifyToken || null;
+        response = await this._callCheckinServerAction({
+          verifyToken,
+          isGambler: options?.isGambler === true
+        });
+        normalized = normalizeCheckinResult(response);
+      }
+    }
+
+    const after = includeUser && (normalized.success || verification?.success) ? await this._getCurrentPointsSnapshot() : null;
+    const previousPoints = before?.points ?? null;
+    const currentPoints = after?.points ?? previousPoints;
+    const pointsDelta = Number.isFinite(previousPoints) && Number.isFinite(currentPoints)
+      ? currentPoints - previousPoints
+      : null;
+    const verifiedByPoints = Boolean(verification?.success) && Number.isFinite(pointsDelta) && pointsDelta > 0;
+    if (verifiedByPoints && !normalized.success) {
+      normalized = {
+        ...normalized,
+        success: true,
+        checkedIn: true,
+        alreadyCheckedIn: false,
+        requiresVerification: false,
+        challenge: null,
+        challengeTicket: null,
+        challengeType: null,
+        captchaMode: null,
+        message: '签到成功'
+      };
+    }
+
+    return {
+      ...response,
+      ...normalized,
+      previousPoints,
+      currentPoints,
+      pointsDelta,
+      user: after?.user ?? before?.user ?? null,
+      autoVerify,
+      verificationAttempted: Boolean(verification),
+      verificationSucceeded: verification?.success ?? false,
+      verification: sanitizeCaptchaVerification(verification),
+      initialCheckin,
+      pointSnapshotError: before?.error || after?.error || undefined
+    };
   }
 
   async getUnreadCount() {

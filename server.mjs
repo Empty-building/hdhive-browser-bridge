@@ -24,6 +24,10 @@ const config = {
   autoWarmup: process.env.AUTO_WARMUP !== 'false',
   // 只读查询短缓存 TTL，默认 60 秒；设为 0 可关闭
   readCacheTtlMs: Number(process.env.READ_CACHE_TTL_MS || process.env.MEDIA_RESOURCES_CACHE_TTL_MS || 60_000),
+  captchaAiBaseUrl: String(process.env.CAPTCHA_AI_BASE_URL || ''),
+  captchaAiApiKey: String(process.env.CAPTCHA_AI_API_KEY || ''),
+  captchaAiModel: String(process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto'),
+  captchaSolver: String(process.env.CAPTCHA_SOLVER || '').toLowerCase(),
   // 数据库配置
   databaseUrl: String(process.env.DATABASE_URL || process.env.BRIDGE_STATE_DATABASE_URL || ''),
   // 加密密钥（用于加密 cookie 存储）
@@ -70,7 +74,11 @@ function getClient(cookieOverride) {
     state.client = new HdhiveClient({
       baseUrl: config.baseUrl,
       cookie,
-      headless: config.headless
+      headless: config.headless,
+      captchaAiBaseUrl: config.captchaAiBaseUrl,
+      captchaAiApiKey: config.captchaAiApiKey,
+      captchaAiModel: config.captchaAiModel,
+      captchaSolver: config.captchaSolver
     });
   } else if (state.client.cookie !== cookie) {
     // 如果 cookie 变了，重建 client
@@ -78,7 +86,11 @@ function getClient(cookieOverride) {
     state.client = new HdhiveClient({
       baseUrl: config.baseUrl,
       cookie,
-      headless: config.headless
+      headless: config.headless,
+      captchaAiBaseUrl: config.captchaAiBaseUrl,
+      captchaAiApiKey: config.captchaAiApiKey,
+      captchaAiModel: config.captchaAiModel,
+      captchaSolver: config.captchaSolver
     });
   }
   return state.client;
@@ -384,7 +396,20 @@ app.post('/hdhive/customer/checkin', async (req, res) => {
   const r = await withTimeout('customer/checkin', async () => {
     clearReadCache();
     const client = getClient(await getRequestCookieAsync(req));
-    const result = await client.checkin();
+    const includeUserValue = req.body?.includeUser ?? req.query?.includeUser;
+    const includeUser = !['false', '0', 'no'].includes(String(includeUserValue ?? '').toLowerCase());
+    const autoVerifyValue = req.body?.autoVerify ?? req.query?.autoVerify;
+    const autoVerify = ['true', '1', 'yes'].includes(String(autoVerifyValue ?? '').toLowerCase());
+    const verificationAttemptsValue = req.body?.verificationAttempts ?? req.query?.verificationAttempts;
+    const parsedVerificationAttempts = Number(verificationAttemptsValue);
+    const verificationAttempts = Number.isFinite(parsedVerificationAttempts) && parsedVerificationAttempts > 0
+      ? Math.min(5, Math.floor(parsedVerificationAttempts))
+      : undefined;
+    const verificationSolverValue = req.body?.verificationSolver ?? req.query?.verificationSolver;
+    const verificationSolver = ['ai', 'auto', 'heuristic'].includes(String(verificationSolverValue || '').toLowerCase())
+      ? String(verificationSolverValue).toLowerCase()
+      : undefined;
+    const result = await client.checkin({ includeUser, autoVerify, verificationAttempts, verificationSolver });
     return { ...result, payload: result.data };
   });
   res.status(r.success ? 200 : 500).json(r);

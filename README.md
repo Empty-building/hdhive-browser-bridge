@@ -186,10 +186,57 @@ for (const log of logs.data.data) {
 ```
 
 #### `checkin()`
-每日签到。
+每日签到。默认会在签到前后读取当前用户积分，用于返回本次积分变化；如只需要原始签到结果，可传 `{ includeUser: false }` 跳过额外查询。
 ```js
 const r = await client.checkin();
-console.log(r.data.message);
+console.log(r.message, r.checkedIn, r.alreadyCheckedIn, r.pointsDelta);
+// {
+//   success: true,
+//   checkedIn: true,
+//   alreadyCheckedIn: false,
+//   requiresVerification: false,
+//   challenge: null,
+//   previousPoints: 100,
+//   currentPoints: 101,
+//   pointsDelta: 1,
+//   data: { ...原始影巢响应 }
+// }
+```
+
+如果当前环境触发 `space_captcha`，可启用自动验证：
+
+```js
+const r = await client.checkin({
+  autoVerify: true,
+  verificationSolver: 'ai',
+  verificationAttempts: 3
+});
+```
+
+AI 求解器只接收验证码图片、提示语和本地图像分割出的候选坐标，不会发送 Cookie、账号或 `challenge_ticket`。需要通过环境变量或构造参数配置：
+
+```bash
+CAPTCHA_AI_BASE_URL=https://cpar.114514heihei.eu.org/v1
+CAPTCHA_AI_API_KEY=your-api-key
+CAPTCHA_AI_MODEL=web2api/gemini-auto
+```
+
+当影巢返回验证码要求时，`success` 为 `false`，同时会包含结构化的 `challenge`：
+
+```js
+{
+  requiresVerification: true,
+  challengeTicket: '...',
+  challengeType: 'space_captcha',
+  captchaMode: 'space',
+  challenge: {
+    ticket: '...',
+    type: 'space_captcha',
+    captchaMode: 'space',
+    action: 'checkin',
+    expiresInSeconds: 600
+  }
+}
 ```
 
 #### `getUnreadCount()`
@@ -447,7 +494,7 @@ await client.close();
 | `GET /hdhive/customer/current` | 当前用户 |
 | `GET /hdhive/customer/points-logs` | 积分日志 |
 | `GET /hdhive/customer/messages/unread-count` | 未读消息 |
-| `POST /hdhive/customer/checkin` | **签到（增加积分！）** |
+| `POST /hdhive/customer/checkin` | **签到（增加积分；可用 `autoVerify=true` 自动处理验证码）** |
 | `GET /hdhive/customer/playlists/my` | 我的播放列表 |
 | `POST /hdhive/customer/subscriptions/check` | 订阅检查 |
 | `GET /hdhive/customer/resources/:id` | 资源详情（限创建者）|
