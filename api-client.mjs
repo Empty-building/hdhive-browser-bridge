@@ -328,6 +328,7 @@ export class HdhiveClient {
     this._ready = false;
     this._hookRegistered = false;
     this._pageNeedsMovieReload = false;
+    this._ensuring = null; // 单飞：正在进行的 _ensureBrowser promise
     this.captchaAiBaseUrl = String(options.captchaAiBaseUrl || process.env.CAPTCHA_AI_BASE_URL || '').replace(/\/$/, '');
     this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
     this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
@@ -336,58 +337,77 @@ export class HdhiveClient {
 
   /**
    * 创建一个持久化浏览器实例（注入 cookie）
+   * 单飞保护：并发调用只 launch 一次，共享同一 promise
    */
   async _ensureBrowser({ injectCookie = true, initialUrl = this.baseUrl } = {}) {
-    if (this._ready && this._page) return;
-    const profileDir = path.join(os.tmpdir(), `hdhive-api-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-    fs.mkdirSync(profileDir, { recursive: true });
-    this._context = await chromium.launchPersistentContext(profileDir, {
-      headless: this.headless,
-      viewport: { width: 1366, height: 768 },
-      locale: 'zh-CN',
-      timezoneId: 'Asia/Shanghai',
-      userAgent: this.userAgent,
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-    await this._context.addInitScript(STEALTH_SCRIPT);
-    await this._context.addInitScript(RSC_INTERCEPTOR_SCRIPT);
-
-    // 拦截图片、广告等无关资源加速加载
-    await this._context.route('**/*', (route) => {
-      const url = route.request().url();
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media'].includes(type)) {
-        return route.abort();
-      }
-      // 拦截 umami 统计
-      if (url.includes('umami.hdhive.com')) return route.abort();
-      return route.continue();
-    });
-
-    if (injectCookie && this.cookie) {
-      const cookies = this.cookie.split(';').map(p => p.trim()).filter(Boolean).map(pair => {
-        const idx = pair.indexOf('=');
-        return {
-          name: pair.slice(0, idx).trim(),
-          value: decodeURIComponent(pair.slice(idx + 1).trim()),
-          domain: this.baseUrl.replace(/^https?:\/\//, ''),
-          path: '/',
-          httpOnly: ['hdh_sa_token', 'csrf_access_token'].includes(pair.slice(0, idx).trim()),
-          secure: true
-        };
-      });
-      try { await this._context.addCookies(cookies); } catch (e) {}
+    // 健康检查：如果 page 已崩溃，清空状态强制重建
+    if (this._page && this._page.isClosed()) {
+      this._ready = false;
+      this._page = null;
     }
+    // 已就绪且 page 健康，直接返回
+    if (this._ready && this._page) return;
 
-    this._page = await this._context.pages()[0] || await this._context.newPage();
-    const targetUrl = initialUrl || this.baseUrl;
-    await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await this._page.waitForFunction(
-      () => document.readyState !== 'loading',
-      { timeout: 5000 }
-    ).catch(() => undefined);
-    this._ready = true;
+    // 单飞：如果正在启动，复用进行中的 promise
+    if (this._ensuring) return this._ensuring;
+
+    this._ensuring = (async () => {
+      const profileDir = path.join(os.tmpdir(), `hdhive-api-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      fs.mkdirSync(profileDir, { recursive: true });
+      this._context = await chromium.launchPersistentContext(profileDir, {
+        headless: this.headless,
+        viewport: { width: 1366, height: 768 },
+        locale: 'zh-CN',
+        timezoneId: 'Asia/Shanghai',
+        userAgent: this.userAgent,
+        ignoreDefaultArgs: ['--enable-automation'],
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      });
+      await this._context.addInitScript(STEALTH_SCRIPT);
+      await this._context.addInitScript(RSC_INTERCEPTOR_SCRIPT);
+
+      // 拦截图片、广告等无关资源加速加载
+      await this._context.route('**/*', (route) => {
+        const url = route.request().url();
+        const type = route.request().resourceType();
+        if (['image', 'font', 'media'].includes(type)) {
+          return route.abort();
+        }
+        // 拦截 umami 统计
+        if (url.includes('umami.hdhive.com')) return route.abort();
+        return route.continue();
+      });
+
+      if (injectCookie && this.cookie) {
+        const cookies = this.cookie.split(';').map(p => p.trim()).filter(Boolean).map(pair => {
+          const idx = pair.indexOf('=');
+          return {
+            name: pair.slice(0, idx).trim(),
+            value: decodeURIComponent(pair.slice(idx + 1).trim()),
+            domain: this.baseUrl.replace(/^https?:\/\//, ''),
+            path: '/',
+            httpOnly: ['hdh_sa_token', 'csrf_access_token'].includes(pair.slice(0, idx).trim()),
+            secure: true
+          };
+        });
+        try { await this._context.addCookies(cookies); } catch (e) {}
+      }
+
+      this._page = await this._context.pages()[0] || await this._context.newPage();
+      const targetUrl = initialUrl || this.baseUrl;
+      await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await this._page.waitForFunction(
+        () => document.readyState !== 'loading',
+        { timeout: 5000 }
+      ).catch(() => undefined);
+      this._ready = true;
+    })();
+
+    try {
+      await this._ensuring;
+    } finally {
+      this._ensuring = null;
+    }
   }
 
   async _reloadPage() {
@@ -1791,12 +1811,15 @@ export class HdhiveClient {
     let urlMatch = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)];
     let codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
 
-    // 如果 page.content() 没拿到，等 RSC 流式 push 写入（最多 3 秒）
+    // 如果 page.content() 没拿到，轮询等待 RSC 流式 push 写入（最多 3 秒，命中即早退）
     if (urlMatch.length === 0 && !codeMatch) {
-      await this._page.waitForTimeout(3000);
-      html = await this._page.content().catch(() => '');
-      urlMatch = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)];
-      codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
+      const deadline = Date.now() + 3000;
+      while (urlMatch.length === 0 && !codeMatch && Date.now() < deadline) {
+        await this._page.waitForTimeout(200);
+        html = await this._page.content().catch(() => '');
+        urlMatch = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)];
+        codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
+      }
     }
 
     // 提取访问码（从各种可能位置）

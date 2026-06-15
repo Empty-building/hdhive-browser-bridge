@@ -149,6 +149,25 @@ function clearReadCache() {
   state.readCache.clear();
 }
 
+// ─────────────────── in-flight 去重（同 key 并发只跑一次）───────────────────
+
+const inflightRequests = new Map();
+
+/**
+ * 对同一 key 的并发请求去重：第一次 miss 时把慢路径 promise 存入 map，
+ * 后续相同 key 的请求复用该 promise，避免重复走慢路径或并发踩踏。
+ */
+function dedupe(key, producer) {
+  if (inflightRequests.has(key)) {
+    return inflightRequests.get(key);
+  }
+  const promise = Promise.resolve()
+    .then(producer)
+    .finally(() => inflightRequests.delete(key));
+  inflightRequests.set(key, promise);
+  return promise;
+}
+
 // ─────────────────── 数据库持久化 cookie ───────────────────
 
 const dbState = {
@@ -278,8 +297,12 @@ async function listCookiesFromDb() {
   }
 }
 
-// 通用 API 调用封装（带超时）
-async function withTimeout(actionName, fn) {
+// ─────────────────── 全局串行队列（消除并发踩踏）───────────────────
+
+let actionChain = Promise.resolve();
+
+// 内部：原 withTimeout 逻辑（超时控制）
+async function _withTimeout(actionName, fn) {
   state.activeAction = { name: actionName, startedAt: Date.now() };
   let timeoutHandle;
   try {
@@ -303,6 +326,14 @@ async function withTimeout(actionName, fn) {
     clearTimeout(timeoutHandle);
     state.activeAction = null;
   }
+}
+
+// 外层：串行化包装（保证单 page 操作串行执行）
+async function withTimeout(actionName, fn) {
+  const run = actionChain.then(() => _withTimeout(actionName, fn));
+  // 队列不因单个任务失败而断裂
+  actionChain = run.then(() => {}, () => {});
+  return run;
 }
 
 // ─────────────────── 生命周期接口 ───────────────────
@@ -598,74 +629,77 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
     const cached = getReadCache(cacheKey);
     if (cached) return { ...cached, cache: { hit: true, ttlMs: config.readCacheTtlMs } };
 
-    const client = getClient(cookie);
+    // in-flight 去重：同一 cacheKey 并发只跑一次，共享结果
+    return dedupe(cacheKey, async () => {
+      const client = getClient(cookie);
 
-    // 1. 解析 TMDB → 内部 URL（无需登录）
-    const resolved = await client.resolveTmdbToInternal(tmdbId, type);
+      // 1. 解析 TMDB → 内部 URL（无需登录）
+      const resolved = await client.resolveTmdbToInternal(tmdbId, type);
 
-    // 2. 找资源列表
-    const resources = await client.findResourcesFromMoviePage(resolved.url);
+      // 2. 找资源列表
+      const resources = await client.findResourcesFromMoviePage(resolved.url);
 
-    // 3. 对每个资源查积分 + 尝试拿 189 链接（不消耗积分，但 getCloud189Links 需要已解锁）
-    const enriched = [];
-    for (const r of resources) {
-      let info = {};
-      let infoError = null;
-      try {
-        info = await client.getResourceUnlockInfo(r);
-      } catch (e) {
-        infoError = e.message.slice(0, 100);
-      }
-
-      const points = info.default_unlock_points ?? info.unlock_points ?? r.unlock_points ?? null;
-      const size = info.share_size ?? r.share_size ?? 0;
-      let link = r.media_url || r.link || '';
-      let code = r.access_code || r.code || '';
-      let isUnlocked = Boolean(r.is_unlocked || r.isUnlocked || link);
-
-      // 只有免费/已解锁资源才需要打开详情页拿链接；付费锁定资源跳过，避免无效等待。
-      if (!link && (isUnlocked || points === 0)) {
+      // 3. 对每个资源查积分 + 尝试拿 189 链接（不消耗积分，但 getCloud189Links 需要已解锁）
+      const enriched = [];
+      for (const r of resources) {
+        let info = {};
+        let infoError = null;
         try {
-          const cloud189 = await client.getCloud189Links(r.slug);
-          if (cloud189.url) {
-            link = cloud189.url;
-            code = cloud189.accessCode || '';
-            isUnlocked = true;
-          }
-        } catch {}
+          info = await client.getResourceUnlockInfo(r);
+        } catch (e) {
+          infoError = e.message.slice(0, 100);
+        }
+
+        const points = info.default_unlock_points ?? info.unlock_points ?? r.unlock_points ?? null;
+        const size = info.share_size ?? r.share_size ?? 0;
+        let link = r.media_url || r.link || '';
+        let code = r.access_code || r.code || '';
+        let isUnlocked = Boolean(r.is_unlocked || r.isUnlocked || link);
+
+        // 只有免费/已解锁资源才需要打开详情页拿链接；付费锁定资源跳过，避免无效等待。
+        if (!link && (isUnlocked || points === 0)) {
+          try {
+            const cloud189 = await client.getCloud189Links(r.slug);
+            if (cloud189.url) {
+              link = cloud189.url;
+              code = cloud189.accessCode || '';
+              isUnlocked = true;
+            }
+          } catch {}
+        }
+
+        const item = {
+          id: r.slug,
+          slug: r.slug,
+          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
+          size,
+          sizeFormatted: formatSize(size),
+          points,
+          isFree: points === 0,
+          link,
+          code,
+          isUnlocked,
+          cloudType: 'cloud189',
+          // 额外字段
+          source: info.source || r.source || 'bridge',
+          movieId: tmdbId,
+          movieType: type
+        };
+        if (infoError && points === null) item.error = infoError;
+        enriched.push(item);
       }
 
-      const item = {
-        id: r.slug,
-        slug: r.slug,
-        title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
-        size,
-        sizeFormatted: formatSize(size),
-        points,
-        isFree: points === 0,
-        link,
-        code,
-        isUnlocked,
-        cloudType: 'cloud189',
-        // 额外字段
-        source: info.source || r.source || 'bridge',
-        movieId: tmdbId,
-        movieType: type
+      const payload = {
+        resources: enriched,
+        movieSlug: resolved.slug,
+        movieUrl: resolved.url,
+        tmdbId,
+        type,
+        cache: { hit: false, ttlMs: config.readCacheTtlMs }
       };
-      if (infoError && points === null) item.error = infoError;
-      enriched.push(item);
-    }
-
-    const payload = {
-      resources: enriched,
-      movieSlug: resolved.slug,
-      movieUrl: resolved.url,
-      tmdbId,
-      type,
-      cache: { hit: false, ttlMs: config.readCacheTtlMs }
-    };
-    setReadCache(cacheKey, payload);
-    return payload;
+      setReadCache(cacheKey, payload);
+      return payload;
+    });
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -935,59 +969,62 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
     const cached = getReadCache(cacheKey);
     if (cached) return { ...cached, cache: { hit: true, ttlMs: config.readCacheTtlMs } };
 
-    const client = getClient(cookie);
+    // in-flight 去重：同一 cacheKey 并发只跑一次，共享结果
+    return dedupe(cacheKey, async () => {
+      const client = getClient(cookie);
 
-    // 解析 TMDB → 影巢内部 URL
-    const resolved = await client.resolveTmdbToInternal(tmdbId, type);
+      // 解析 TMDB → 影巢内部 URL
+      const resolved = await client.resolveTmdbToInternal(tmdbId, type);
 
-    // 找资源列表
-    const resources = await client.findResourcesFromMoviePage(resolved.url);
+      // 找资源列表
+      const resources = await client.findResourcesFromMoviePage(resolved.url);
 
-    // 对每个资源查需要的积分（优先 DOM，checkResource 兜底；不消耗）
-    const enriched = [];
-    for (const r of resources) {
-      try {
-        const info = await client.getResourceUnlockInfo(r);
-        enriched.push({
-          slug: r.slug,
-          url: r.url,
-          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
-          unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
-          website: info.website,
-          share_size: info.share_size ?? r.share_size ?? 0,
-          is_free: info.is_free ?? r.is_free ?? false,
-          source: info.source
-        });
-      } catch (e) {
-        enriched.push({
-          slug: r.slug,
-          url: r.url,
-          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
-          unlock_points: null,
-          error: e.message.slice(0, 100)
-        });
+      // 对每个资源查需要的积分（优先 DOM，checkResource 兜底；不消耗）
+      const enriched = [];
+      for (const r of resources) {
+        try {
+          const info = await client.getResourceUnlockInfo(r);
+          enriched.push({
+            slug: r.slug,
+            url: r.url,
+            title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+            unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
+            website: info.website,
+            share_size: info.share_size ?? r.share_size ?? 0,
+            is_free: info.is_free ?? r.is_free ?? false,
+            source: info.source
+          });
+        } catch (e) {
+          enriched.push({
+            slug: r.slug,
+            url: r.url,
+            title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+            unlock_points: null,
+            error: e.message.slice(0, 100)
+          });
+        }
       }
-    }
 
-    // 当前用户积分
-    let currentPoints = null;
-    try {
-      const user = await client.getCurrentUser();
-      currentPoints = user.data?.data?.user_meta?.points;
-    } catch {}
+      // 当前用户积分
+      let currentPoints = null;
+      try {
+        const user = await client.getCurrentUser();
+        currentPoints = user.data?.data?.user_meta?.points;
+      } catch {}
 
-    const payload = {
-      tmdbId,
-      type,
-      movieSlug: resolved.slug,
-      movieUrl: resolved.url,
-      currentPoints,
-      resources: enriched,
-      totalCost: enriched.reduce((sum, r) => sum + (r.unlock_points || 0), 0),
-      cache: { hit: false, ttlMs: config.readCacheTtlMs }
-    };
-    setReadCache(cacheKey, payload);
-    return payload;
+      const payload = {
+        tmdbId,
+        type,
+        movieSlug: resolved.slug,
+        movieUrl: resolved.url,
+        currentPoints,
+        resources: enriched,
+        totalCost: enriched.reduce((sum, r) => sum + (r.unlock_points || 0), 0),
+        cache: { hit: false, ttlMs: config.readCacheTtlMs }
+      };
+      setReadCache(cacheKey, payload);
+      return payload;
+    });
   });
   res.status(r.success ? 200 : 500).json(r);
 });
