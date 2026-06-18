@@ -75,7 +75,7 @@ docker-compose logs -f hdhive-api
 | `BROWSER_HEADLESS` | ❌ | `true` | 是否无头模式（调试可设 `false`）|
 | `ACTION_TIMEOUT_MS` | ❌ | `180000` | 单个接口超时（毫秒）|
 | `AUTO_WARMUP` | ❌ | `true` | 启动时自动预热浏览器 |
-| `CAPTCHA_AI_BASE_URL` | ❌ | 空 | 自动签到验证码 AI endpoint，例如 `https://cpar.114514heihei.eu.org/v1` |
+| `CAPTCHA_AI_BASE_URL` | ❌ | 空 | 自动签到验证码 AI endpoint，例如 `https://example.com/v1` |
 | `CAPTCHA_AI_API_KEY` | ❌ | 空 | 自动签到验证码 AI key。只用于验证码图片识别，不会发送 Cookie |
 | `CAPTCHA_AI_MODEL` | ❌ | `web2api/gemini-auto` | 自动签到验证码模型 |
 | `CAPTCHA_SOLVER` | ❌ | 空 | 默认验证码求解器，可设 `ai`、`auto` 或 `heuristic` |
