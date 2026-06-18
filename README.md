@@ -2,6 +2,8 @@
 
 纯 Node.js 客户端，通过 Playwright + 浏览器内部 WASM 签名模块调用影巢（hdhive.com）的所有 customer API。**无需账号密码**，只需 cookie 即可使用。
 
+推荐！[Docker快速部署](DEPLOY.md)
+
 > ⚠️ 本项目仅用于学习研究，请遵守影巢的服务条款。
 
 ---
