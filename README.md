@@ -216,7 +216,7 @@ const r = await client.checkin({
 AI 求解器只接收验证码图片、提示语和本地图像分割出的候选坐标，不会发送 Cookie、账号或 `challenge_ticket`。需要通过环境变量或构造参数配置：
 
 ```bash
-CAPTCHA_AI_BASE_URL=https://cpar.114514heihei.eu.org/v1
+CAPTCHA_AI_BASE_URL=https://example.com/v1
 CAPTCHA_AI_API_KEY=your-api-key
 CAPTCHA_AI_MODEL=web2api/gemini-auto
 ```
