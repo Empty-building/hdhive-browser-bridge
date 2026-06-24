@@ -21,5 +21,11 @@ services:
         value: "300000"
       - key: KEEPALIVE_INTERVAL_MS
         value: "25000"
+      - key: AUTO_LOGIN
+        value: "true"
+      - key: HDHIVE_USERNAME
+        sync: false
+      - key: HDHIVE_PASSWORD
+        sync: false
       - key: BRIDGE_TOKEN
         generateValue: true

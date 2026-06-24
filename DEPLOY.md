@@ -55,6 +55,9 @@ docker-compose logs -f hdhive-api
 |---|---|---|---|
 | BRIDGE_TOKEN | ❌ | 空 | API 保护 token。空 = 不校验（**生产环境务必设置**） |
 | HDHIVE_COOKIE | ❌ | 空 | 默认 cookie。如果不设，每个请求需单独传 |
+| HDHIVE_USERNAME | ❌ | 空 | 影巢登录账号。配置后可在 cookie 缺失/不完整时自动登录 |
+| HDHIVE_PASSWORD | ❌ | 空 | 影巢登录密码。只从环境变量读取，不要写入代码或镜像 |
+| AUTO_LOGIN | ❌ | true | 是否允许启动时用 `HDHIVE_USERNAME`/`HDHIVE_PASSWORD` 自动登录并保存 cookie |
 | HDHIVE_BASE_URL | ❌ | https://hdhive.com | 影巢基础 URL |
 | BROWSER_HEADLESS | ❌ | true | 是否无头模式（调试可设 false） |
 | ACTION_TIMEOUT_MS | ❌ | 180000 | 单个接口超时（毫秒） |
@@ -134,6 +137,7 @@ curl -H "x-bridge-token: $(grep BRIDGE_TOKEN .env | cut -d= -f2)" \
 | 启动时 DB 无 cookie + env 有 HDHIVE_COOKIE | **自动保存** env cookie 到 DB |
 | 启动时 DB 有 cookie + env 无 HDHIVE_COOKIE | **自动加载** DB cookie 作为默认 |
 | 启动时 DB 有 cookie + env 有 HDHIVE_COOKIE | 优先用 env，DB 保留 |
+| 启动时 cookie 缺失/不完整 + env 有 HDHIVE_USERNAME/HDHIVE_PASSWORD | **自动登录并加密保存**新 cookie |
 | 调用 POST /hdhive/login | 登录后**自动加密保存**到 DB |
 | 调用 POST /admin/cookies/:key | 手动设置（无登录直接写） |
 ### 数据库表结构

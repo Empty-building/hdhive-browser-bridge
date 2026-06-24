@@ -17,11 +17,14 @@ const config = {
   defaultUsername: String(process.env.HDHIVE_USERNAME || ''),
   defaultPassword: String(process.env.HDHIVE_PASSWORD || ''),
   baseUrl: String(process.env.HDHIVE_BASE_URL || 'https://hdhive.com'),
+  userAgent: String(process.env.BROWSER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'),
   headless: process.env.BROWSER_HEADLESS !== 'false',
   // 接口超时（单个请求最长执行时间）
   actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 180_000),
   // 是否启用自动 warmup
   autoWarmup: process.env.AUTO_WARMUP !== 'false',
+  // cookie 不完整时，是否允许用 HDHIVE_USERNAME/HDHIVE_PASSWORD 自动登录
+  autoLogin: process.env.AUTO_LOGIN !== 'false',
   // 只读查询短缓存 TTL，默认 60 秒；设为 0 可关闭
   readCacheTtlMs: Number(process.env.READ_CACHE_TTL_MS || process.env.MEDIA_RESOURCES_CACHE_TTL_MS || 60_000),
   captchaAiBaseUrl: String(process.env.CAPTCHA_AI_BASE_URL || ''),
@@ -30,10 +33,13 @@ const config = {
   captchaSolver: String(process.env.CAPTCHA_SOLVER || '').toLowerCase(),
   // 数据库配置
   databaseUrl: String(process.env.DATABASE_URL || process.env.BRIDGE_STATE_DATABASE_URL || ''),
+  databaseSsl: String(process.env.BRIDGE_STATE_DATABASE_SSL || ''),
   // 加密密钥（用于加密 cookie 存储）
   encryptSecret: String(process.env.BRIDGE_STATE_SECRET || process.env.BRIDGE_TOKEN || ''),
   // cookie key 前缀（区分不同 Bridge 实例）
-  cookieKey: String(process.env.COOKIE_KEY || process.env.BRIDGE_STATE_KEY || 'default')
+  cookieKey: String(process.env.COOKIE_KEY || process.env.BRIDGE_STATE_KEY || 'default'),
+  // 兼容旧 browser-bridge 的状态表 key
+  legacyStateKey: String(process.env.BRIDGE_STATE_KEY || 'hdhive-default')
 };
 
 // 全局状态
@@ -69,6 +75,10 @@ function getClient(cookieOverride) {
   const cookie = cookieOverride || config.defaultCookie;
   if (!cookie) {
     throw new Error('no cookie available: set HDHIVE_COOKIE env or pass cookie in body/header');
+  }
+  const missingLoginCookies = getMissingLoginCookieNames(cookie);
+  if (missingLoginCookies.length > 0) {
+    throw new Error(`cookie is incomplete: missing ${missingLoginCookies.join(', ')}; re-login or set a full HDHIVE_COOKIE`);
   }
   if (!state.client) {
     state.client = new HdhiveClient({
@@ -184,6 +194,38 @@ const dbState = {
   `
 };
 
+function resolveDatabaseSsl(databaseUrl, sslMode) {
+  const mode = String(sslMode || '').trim().toLowerCase();
+  if (['false', '0', 'off', 'disable'].includes(mode)) return false;
+  if (mode === 'verify-full') return true;
+  if (['true', '1', 'on', 'require', 'prefer', 'verify-ca'].includes(mode)) {
+    return { rejectUnauthorized: false };
+  }
+
+  try {
+    const url = new URL(databaseUrl);
+    const urlSslMode = String(url.searchParams.get('sslmode') || '').trim().toLowerCase();
+    if (['disable', 'false', '0', 'off'].includes(urlSslMode)) return false;
+    if (urlSslMode === 'verify-full') return true;
+    if (['require', 'prefer', 'verify-ca'].includes(urlSslMode)) {
+      return { rejectUnauthorized: false };
+    }
+    if (['localhost', '127.0.0.1', '::1'].includes(url.hostname)) return false;
+  } catch {}
+
+  return { rejectUnauthorized: false };
+}
+
+function normalizeDatabaseUrl(databaseUrl) {
+  try {
+    const url = new URL(databaseUrl);
+    url.searchParams.delete('sslmode');
+    return url.toString();
+  } catch {
+    return databaseUrl;
+  }
+}
+
 function getEncryptionKey(secret) {
   if (!secret) return null;
   return createHash('sha256').update(String(secret)).digest();
@@ -211,16 +253,111 @@ function decryptCookie(ciphertext, secret) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
+function decodeLegacyStateValue(value) {
+  const parsed = JSON.parse(String(value || '{}'));
+  if (parsed.encoding === 'plain-json') {
+    return JSON.parse(parsed.data || '{}');
+  }
+  if (parsed.encoding !== 'aes-256-gcm') {
+    return parsed;
+  }
+  const key = getEncryptionKey(config.encryptSecret);
+  if (!key) throw new Error('BRIDGE_STATE_SECRET or BRIDGE_TOKEN must be set for legacy state storage');
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(parsed.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(parsed.data, 'base64')),
+    decipher.final()
+  ]);
+  return JSON.parse(decrypted.toString('utf8'));
+}
+
+function getCookieNames(cookie) {
+  return new Set(
+    String(cookie || '')
+      .split(';')
+      .map(part => part.trim().split('=')[0])
+      .filter(Boolean)
+  );
+}
+
+const REQUIRED_LOGIN_COOKIE_NAMES = ['token', 'csrf_access_token', 'hdh_uid', 'hdh_sa_token'];
+
+function getMissingLoginCookieNames(cookie) {
+  const names = getCookieNames(cookie);
+  return REQUIRED_LOGIN_COOKIE_NAMES.filter(name => !names.has(name));
+}
+
+function hasCompleteLoginCookie(cookie) {
+  return Boolean(cookie) && getMissingLoginCookieNames(cookie).length === 0;
+}
+
+function summarizeCookie(cookie) {
+  const names = [...getCookieNames(cookie)].sort();
+  const missingLoginCookies = REQUIRED_LOGIN_COOKIE_NAMES.filter(name => !names.includes(name));
+  return {
+    decryptOk: true,
+    cookieNames: names,
+    cookieCount: names.length,
+    score: scoreCookie(cookie),
+    hasCompleteLoginCookie: missingLoginCookies.length === 0,
+    missingLoginCookies
+  };
+}
+
+function scoreCookie(cookie) {
+  const names = getCookieNames(cookie);
+  let score = 0;
+  if (names.has('token')) score += 100;
+  if (names.has('csrf_access_token')) score += 40;
+  if (names.has('hdh_uid')) score += 40;
+  if (names.has('refresh_token')) score += 20;
+  if (names.has('hdh_sa_token')) score += 10;
+  score += Math.min(10, names.size);
+  return score;
+}
+
+function storageStateToCookieHeader(snapshot) {
+  const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
+  if (cookies.length === 0) return '';
+
+  let baseHost = '';
+  try {
+    baseHost = new URL(config.baseUrl).hostname;
+  } catch {}
+
+  return cookies
+    .filter(cookie => {
+      if (!cookie?.name || cookie.value === undefined || cookie.value === null) return false;
+      if (!baseHost || !cookie.domain) return true;
+      const domain = String(cookie.domain).replace(/^\./, '');
+      return baseHost === domain || baseHost.endsWith(`.${domain}`);
+    })
+    .map(cookie => `${cookie.name}=${encodeURIComponent(String(cookie.value))}`)
+    .join('; ');
+}
+
+function getLegacyStateKeyCandidates(key) {
+  return [...new Set([
+    config.legacyStateKey,
+    process.env.BRIDGE_STATE_KEY,
+    key,
+    `hdhive-${key}`,
+    'hdhive-default'
+  ].filter(Boolean).map(String))];
+}
+
 async function initDatabase() {
   if (!config.databaseUrl) return false;
   if (dbState.initialized) return true;
 
   try {
     dbState.pool = new pg.Pool({
-      connectionString: config.databaseUrl,
-      ssl: config.databaseUrl.includes('sslmode=require') ? { rejectUnauthorized: false } : false,
+      connectionString: normalizeDatabaseUrl(config.databaseUrl),
+      ssl: resolveDatabaseSsl(config.databaseUrl, config.databaseSsl),
       max: 5,
-      idleTimeoutMillis: 30000
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
     });
     await dbState.pool.query(dbState.schema);
     dbState.initialized = true;
@@ -256,16 +393,126 @@ async function saveCookieToDb(key, cookie, meta = {}) {
 
 async function loadCookieFromDb(key) {
   if (!dbState.initialized) return null;
+
+  const candidates = [];
+  const cookieKeys = [...new Set([key, config.cookieKey, 'default'].filter(Boolean).map(String))];
+
+  for (const cookieKey of cookieKeys) {
+    try {
+      const r = await dbState.pool.query(
+        'SELECT cookie_encrypted, updated_at FROM hdhive_cookies WHERE key = $1',
+        [cookieKey]
+      );
+      if (r.rows.length > 0) {
+        const cookie = decryptCookie(r.rows[0].cookie_encrypted, config.encryptSecret);
+        if (cookie) {
+          candidates.push({
+            source: 'hdhive_cookies',
+            key: cookieKey,
+            cookie,
+            updatedAt: r.rows[0].updated_at
+          });
+        }
+      }
+    } catch (e) {
+      console.error(`[hdhive-api] load cookie failed from hdhive_cookies key=${cookieKey}:`, e.message);
+    }
+  }
+
+  for (const stateKey of getLegacyStateKeyCandidates(key)) {
+    try {
+      const r = await dbState.pool.query(
+        'SELECT value, updated_at FROM browser_bridge_state WHERE key = $1',
+        [stateKey]
+      );
+      if (r.rows.length > 0) {
+        const snapshot = decodeLegacyStateValue(r.rows[0].value);
+        const cookie = storageStateToCookieHeader(snapshot);
+        if (cookie) {
+          candidates.push({
+            source: 'browser_bridge_state',
+            key: stateKey,
+            cookie,
+            updatedAt: r.rows[0].updated_at
+          });
+        }
+      }
+    } catch (e) {
+      if (e.code === '42P01') break;
+      console.error(`[hdhive-api] load cookie failed from browser_bridge_state key=${stateKey}:`, e.message);
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    const scoreDelta = scoreCookie(b.cookie) - scoreCookie(a.cookie);
+    if (scoreDelta !== 0) return scoreDelta;
+    return new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime();
+  });
+
+  const selected = candidates[0];
+  const missingLoginCookies = getMissingLoginCookieNames(selected.cookie);
+  console.log(`[hdhive-api] loaded cookie from ${selected.source} key=${selected.key} score=${scoreCookie(selected.cookie)}`);
+  if (missingLoginCookies.length > 0) {
+    console.warn(`[hdhive-api] stored cookie is incomplete; missing ${missingLoginCookies.join(', ')}`);
+  }
+  return selected.cookie;
+}
+
+async function getStoredCookieStatus() {
+  if (!dbState.initialized) return { enabled: false };
   try {
-    const r = await dbState.pool.query(
-      'SELECT cookie_encrypted FROM hdhive_cookies WHERE key = $1',
-      [key]
+    const rows = [];
+    const current = await dbState.pool.query(
+      'SELECT key, cookie_encrypted, meta, created_at, updated_at, length(cookie_encrypted) AS encrypted_len FROM hdhive_cookies ORDER BY updated_at DESC'
     );
-    if (r.rows.length === 0) return null;
-    return decryptCookie(r.rows[0].cookie_encrypted, config.encryptSecret);
+    for (const row of current.rows) {
+      let cookieStatus = { decryptOk: false };
+      try {
+        cookieStatus = summarizeCookie(decryptCookie(row.cookie_encrypted, config.encryptSecret));
+      } catch (e) {
+        cookieStatus = { decryptOk: false, error: e.message };
+      }
+      rows.push({
+        source: 'hdhive_cookies',
+        key: row.key,
+        meta: row.meta,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        encrypted_len: Number(row.encrypted_len),
+        hasCookie: true,
+        ...cookieStatus
+      });
+    }
+
+    try {
+      const legacy = await dbState.pool.query(
+        'SELECT key, value, updated_at, length(value) AS value_len FROM browser_bridge_state ORDER BY updated_at DESC'
+      );
+      for (const row of legacy.rows) {
+        let cookieStatus = { decryptOk: false };
+        try {
+          cookieStatus = summarizeCookie(storageStateToCookieHeader(decodeLegacyStateValue(row.value)));
+        } catch (e) {
+          cookieStatus = { decryptOk: false, error: e.message };
+        }
+        rows.push({
+          source: 'browser_bridge_state',
+          key: row.key,
+          updated_at: row.updated_at,
+          encrypted_len: Number(row.value_len),
+          hasCookie: true,
+          ...cookieStatus
+        });
+      }
+    } catch (e) {
+      if (e.code !== '42P01') throw e;
+    }
+
+    return { enabled: true, cookies: rows, count: rows.length };
   } catch (e) {
-    console.error('[hdhive-api] load cookie failed:', e.message);
-    return null;
+    return { enabled: true, cookies: [], count: 0, error: e.message };
   }
 }
 
@@ -280,21 +527,8 @@ async function deleteCookieFromDb(key) {
 }
 
 async function listCookiesFromDb() {
-  if (!dbState.initialized) return [];
-  try {
-    const r = await dbState.pool.query(
-      'SELECT key, meta, created_at, updated_at FROM hdhive_cookies ORDER BY updated_at DESC'
-    );
-    return r.rows.map(row => ({
-      key: row.key,
-      meta: row.meta,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      hasCookie: true
-    }));
-  } catch {
-    return [];
-  }
+  const status = await getStoredCookieStatus();
+  return status.cookies || [];
 }
 
 // ─────────────────── 全局串行队列（消除并发踩踏）───────────────────
@@ -341,8 +575,9 @@ async function withTimeout(actionName, fn) {
 // 健康检查（无需 token）
 app.get('/health', async (req, res) => {
   const ready = Boolean(state.client && state.warmupOk);
-  res.status(ready ? 200 : 503).json({
-    success: ready,
+  res.status(200).json({
+    success: true,
+    ready,
     status: ready ? 'healthy' : 'warming_up',
     uptime: Date.now() - state.startedAt,
     totalCalls: state.totalCalls,
@@ -378,7 +613,17 @@ app.get('/metrics', (req, res) => {
         baseUrl: config.baseUrl,
         hasToken: Boolean(config.bridgeToken),
         hasDefaultCookie: Boolean(config.defaultCookie),
-        headless: config.headless
+        hasCompleteDefaultCookie: hasCompleteLoginCookie(config.defaultCookie),
+        hasDefaultUsername: Boolean(config.defaultUsername),
+        autoLogin: config.autoLogin,
+        headless: config.headless,
+        database: {
+          enabled: Boolean(config.databaseUrl),
+          initialized: dbState.initialized,
+          cookieKey: config.cookieKey,
+          legacyStateKey: config.legacyStateKey,
+          hasEncryptionSecret: Boolean(config.encryptSecret)
+        }
       }
     }
   });
@@ -387,7 +632,8 @@ app.get('/metrics', (req, res) => {
 // 预热：启动浏览器
 app.post('/warmup', async (req, res) => {
   const r = await withTimeout('warmup', async () => {
-    const cookie = getRequestCookie(req);
+    const startedAt = Date.now();
+    const cookie = await getRequestCookieAsync(req);
     if (!cookie) throw new Error('no cookie');
     const client = getClient(cookie);
     if (!state.client._ready) {
@@ -395,7 +641,7 @@ app.post('/warmup', async (req, res) => {
     }
     state.warmupAt = Date.now();
     state.warmupOk = true;
-    return { warmed: true, elapsedMs: Date.now() - state.warmupAt };
+    return { warmed: true, elapsedMs: Date.now() - startedAt };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -746,119 +992,165 @@ app.get('/hdhive/public/bulletins/latest', async (req, res) => {
   res.status(r.success ? 200 : 500).json(r);
 });
 
+async function activateDefaultCookie(cookie) {
+  if (!cookie || config.defaultCookie === cookie) return;
+  config.defaultCookie = cookie;
+  if (state.client && state.client.cookie !== cookie) {
+    await state.client.close().catch(() => {});
+    state.client = null;
+    state.warmupOk = false;
+    clearReadCache();
+  }
+}
+
+async function performHdhiveLogin({
+  username = config.defaultUsername,
+  password = config.defaultPassword,
+  saveKey = config.cookieKey,
+  source = 'login',
+  requestUserAgent = '',
+  activate = true
+} = {}) {
+  if (!username || !password) {
+    throw new Error('username and password are required');
+  }
+
+  const { chromium } = await import('playwright');
+  const profileDir = path.join(os.tmpdir(), `hdhive-login-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  const ctx = await chromium.launchPersistentContext(profileDir, {
+    headless: config.headless,
+    viewport: { width: 1366, height: 768 },
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
+    userAgent: config.userAgent,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  });
+
+  try {
+    await ctx.addInitScript(STEALTH_SCRIPT);
+    await ctx.addInitScript(RSC_INTERCEPTOR_SCRIPT);
+
+    const page = await ctx.pages()[0] || await ctx.newPage();
+    await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+
+    const usernameInput = page.locator('input[name="username"], input[type="email"], input[type="text"]').first();
+    const passwordInput = page.locator('input[type="password"]').first();
+    await passwordInput.waitFor({ state: 'visible', timeout: 30000 }).catch(() => undefined);
+    if (await passwordInput.count().catch(() => 0) === 0) {
+      throw new Error('login form not found');
+    }
+
+    await usernameInput.fill(username, { timeout: 15000 });
+    await passwordInput.fill(password, { timeout: 15000 });
+    const submit = page.locator('button[type="submit"], button:has-text("登录"), [role="button"]:has-text("登录")').first();
+    if (await submit.count() > 0) await submit.click({ timeout: 15000 });
+    else await passwordInput.press('Enter', { timeout: 15000 });
+
+    const deadline = Date.now() + 45_000;
+    let cookies = [];
+    let missingLoginCookies = [...REQUIRED_LOGIN_COOKIE_NAMES];
+    let lastPageText = '';
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(1000);
+      cookies = await ctx.cookies(config.baseUrl);
+      const presentCookieNames = new Set(cookies.map(c => c.name));
+      missingLoginCookies = REQUIRED_LOGIN_COOKIE_NAMES.filter(name => !presentCookieNames.has(name));
+      if (missingLoginCookies.length === 0) break;
+      lastPageText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
+      if (/验证码|二次验证|两步验证/.test(lastPageText)) break;
+    }
+
+    if (missingLoginCookies.length > 0) {
+      const suffix = /验证码|二次验证|两步验证/.test(lastPageText)
+        ? '，页面要求验证码/二次验证'
+        : '，可能需要验证码/二次验证';
+      throw new Error(`login failed: missing login cookies (${missingLoginCookies.join(', ')})${suffix}`);
+    }
+
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    if (activate) {
+      await activateDefaultCookie(cookieHeader);
+    }
+
+    let userInfo = null;
+    try {
+      const hdhUid = await page.evaluate(() => {
+        const m = document.cookie.match(/(?:^|;\s*)hdh_uid=([^;]+)/);
+        return m ? m[1] : null;
+      });
+      userInfo = { hdh_uid: hdhUid };
+    } catch {}
+
+    let dbSaved = null;
+    if (dbState.initialized) {
+      dbSaved = await saveCookieToDb(saveKey, cookieHeader, {
+        hdh_uid: userInfo?.hdh_uid,
+        source,
+        ua: String(requestUserAgent || '').slice(0, 200)
+      });
+    }
+
+    return {
+      cookie: cookieHeader,
+      cookieHeader,
+      cookieNames: cookies.map(c => c.name),
+      cookies: cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        expires: c.expires,
+        httpOnly: c.httpOnly,
+        secure: c.secure
+      })),
+      user: userInfo,
+      currentUser: userInfo,
+      persisted: dbSaved,
+      key: saveKey
+    };
+  } finally {
+    await ctx.close().catch(() => {});
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
+}
+
+async function autoLoginFromEnv(reason) {
+  if (!config.autoLogin || !config.defaultUsername || !config.defaultPassword) {
+    return null;
+  }
+  console.log(`[hdhive-api] auto login from HDHIVE_USERNAME/HDHIVE_PASSWORD (${reason})...`);
+  const result = await performHdhiveLogin({
+    source: `auto-${reason}`,
+    requestUserAgent: 'startup',
+    activate: true
+  });
+  console.log(`[hdhive-api] auto login OK; cookies=${result.cookieNames.join(', ')} persisted=${Boolean(result.persisted?.saved)}`);
+  return result;
+}
+
 // ─────────────────── 账号密码登录 ───────────────────
 
 // 登录后获取 cookie 字符串（**会消耗一次登录请求**）
 // ⚠️ 此接口会实际登录影巢账号，建议只在 cookie 过期时调用
 app.post('/hdhive/login', async (req, res) => {
   const r = await withTimeout('login', async () => {
-    const username = req.body?.username || config.defaultUsername;
-    const password = req.body?.password || config.defaultPassword;
-    if (!username || !password) {
-      throw new Error('username and password are required');
-    }
-
-    // 启动一个临时浏览器（独立 context，不影响主 client）
-    const { chromium } = await import('playwright');
-    const profileDir = path.join(os.tmpdir(), `hdhive-login-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-    fs.mkdirSync(profileDir, { recursive: true });
-
-    const ctx = await chromium.launchPersistentContext(profileDir, {
-      headless: config.headless,
-      viewport: { width: 1366, height: 768 },
-      locale: 'zh-CN',
-      timezoneId: 'Asia/Shanghai',
-      userAgent: config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    const result = await performHdhiveLogin({
+      username: req.body?.username || config.defaultUsername,
+      password: req.body?.password || config.defaultPassword,
+      saveKey: req.body?.key || config.cookieKey,
+      source: 'login',
+      requestUserAgent: req.get('user-agent') || '',
+      activate: true
     });
-
-    try {
-      // 注入 stealth + RSC interceptor
-      await ctx.addInitScript(STEALTH_SCRIPT);
-
-      // 访问登录页
-      const page = await ctx.pages()[0] || await ctx.newPage();
-      await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
-
-      // 等表单出现
-      let formFound = false;
-      for (let i = 0; i < 30; i++) {
-        if (await page.locator('input[type="password"]').count().catch(() => 0) > 0) {
-          formFound = true;
-          break;
-        }
-        await page.waitForTimeout(1000);
-      }
-      if (!formFound) throw new Error('login form not found');
-
-      // 填写表单
-      await page.locator('input[name="username"], input[type="email"], input[type="text"]').first().fill(username);
-      await page.locator('input[type="password"]').first().fill(password);
-      const submit = page.locator('button[type="submit"], button:has-text("登录")').first();
-      if (await submit.count() > 0) await submit.click();
-      else await page.locator('input[type="password"]').first().press('Enter');
-
-      // 等登录完成（URL 跳转走）
-      await page.waitForTimeout(15000);
-
-      // 提取 cookie
-      const cookies = await ctx.cookies();
-      const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-      const loginCookieNames = ['token', 'csrf_access_token', 'hdh_uid', 'hdh_sa_token'];
-      const hasLoginCookie = cookies.some(c => loginCookieNames.includes(c.name));
-
-      if (!hasLoginCookie) {
-        throw new Error('login failed: no login cookies found (可能需要验证码/二次验证)');
-      }
-
-      // 同时尝试获取用户信息验证
-      let userInfo = null;
-      try {
-        // 简化：尝试访问当前用户 API
-        const u = await page.evaluate(() => {
-          const m = document.cookie.match(/(?:^|;\s*)hdh_uid=([^;]+)/);
-          return m ? m[1] : null;
-        });
-        userInfo = { hdh_uid: u };
-      } catch {}
-
-      // 自动持久化到数据库（如果配置了）
-      let dbSaved = null;
-      const saveKey = req.body?.key || config.cookieKey;
-      if (dbState.initialized) {
-        dbSaved = await saveCookieToDb(saveKey, cookieHeader, {
-          hdh_uid: userInfo?.hdh_uid,
-          source: 'login',
-          ua: req.get('user-agent')?.slice(0, 200)
-        });
-      }
-
-      return {
-        cookie: cookieHeader,
-        cookieHeader,
-        cookieNames: cookies.map(c => c.name),
-        cookies: cookies.map(c => ({
-          name: c.name,
-          value: c.value,
-          domain: c.domain,
-          expires: c.expires,
-          httpOnly: c.httpOnly,
-          secure: c.secure
-        })),
-        user: userInfo,
-        currentUser: userInfo,
-        persisted: dbSaved,
-        key: saveKey,
-        note: dbSaved?.saved
-          ? '✓ Cookie 已加密保存到数据库，下次启动自动恢复'
-          : '保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用'
-      };
-    } finally {
-      await ctx.close().catch(() => {});
-    }
+    return {
+      ...result,
+      note: result.persisted?.saved
+        ? '✓ Cookie 已加密保存到数据库，下次启动自动恢复'
+        : '保存 cookie 到 HDHIVE_COOKIE 环境变量或请求头，下次请求使用'
+    };
   });
 
   res.status(r.success ? 200 : 500).json(r);
@@ -912,8 +1204,7 @@ app.get('/admin/cookies', async (req, res) => {
     if (!dbState.initialized) {
       return { enabled: false, cookies: [], message: 'database not configured' };
     }
-    const cookies = await listCookiesFromDb();
-    return { enabled: true, cookies, count: cookies.length };
+    return await getStoredCookieStatus();
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -1067,30 +1358,47 @@ app.listen(config.port, '0.0.0.0', async () => {
   console.log(`[hdhive-api] baseUrl=${config.baseUrl} headless=${config.headless}`);
   console.log(`[hdhive-api] BRIDGE_TOKEN=${config.bridgeToken ? 'set' : 'EMPTY (public)'}`);
   console.log(`[hdhive-api] HDHIVE_COOKIE=${config.defaultCookie ? 'set' : 'EMPTY (need to pass per-request)'}`);
+  console.log(`[hdhive-api] HDHIVE_USERNAME=${config.defaultUsername ? 'set' : 'EMPTY'} AUTO_LOGIN=${config.autoLogin ? 'true' : 'false'}`);
 
   // 初始化数据库（可选）
+  let existingDbCookie = null;
   if (config.databaseUrl) {
     const dbOk = await initDatabase();
     console.log(`[hdhive-api] DATABASE_URL=${dbOk ? 'connected' : 'FAILED'}`);
     if (dbOk && config.cookieKey) {
-      // 启动时：如果 DB 没有 cookie 但 env 有，自动保存到 DB
-      const existingDbCookie = await loadCookieFromDb(config.cookieKey);
-      if (!existingDbCookie && config.defaultCookie) {
-        const saved = await saveCookieToDb(config.cookieKey, config.defaultCookie, { source: 'env-on-startup' });
-        console.log(`[hdhive-api] ✓ Cookie auto-saved to DB from env: ${saved.saved}`);
-      } else if (existingDbCookie && !config.defaultCookie) {
-        // 从数据库加载
-        config.defaultCookie = existingDbCookie;
+      existingDbCookie = await loadCookieFromDb(config.cookieKey);
+
+      if (hasCompleteLoginCookie(config.defaultCookie)) {
+        if (!existingDbCookie || !hasCompleteLoginCookie(existingDbCookie)) {
+          const saved = await saveCookieToDb(config.cookieKey, config.defaultCookie, { source: 'env-on-startup' });
+          console.log(`[hdhive-api] ✓ Cookie auto-saved to DB from env: ${saved.saved}`);
+        } else {
+          console.log(`[hdhive-api] complete cookie already in DB for key=${config.cookieKey}`);
+        }
+      } else if (config.defaultCookie) {
+        console.warn(`[hdhive-api] HDHIVE_COOKIE is incomplete; missing ${getMissingLoginCookieNames(config.defaultCookie).join(', ')}`);
+      }
+
+      if (!hasCompleteLoginCookie(config.defaultCookie) && hasCompleteLoginCookie(existingDbCookie)) {
+        await activateDefaultCookie(existingDbCookie);
         console.log(`[hdhive-api] ✓ Loaded cookie from database (key=${config.cookieKey}, ${existingDbCookie.length} chars)`);
-      } else {
-        console.log(`[hdhive-api] cookie already in DB for key=${config.cookieKey}`);
+      } else if (!config.defaultCookie && !existingDbCookie) {
+        console.log(`[hdhive-api] no cookie in DB for key=${config.cookieKey}`);
       }
     }
   } else {
     console.log(`[hdhive-api] DATABASE_URL=EMPTY (cookie not persisted)`);
   }
 
-  if (config.autoWarmup && config.defaultCookie) {
+  if (!hasCompleteLoginCookie(config.defaultCookie) && config.defaultUsername && config.defaultPassword) {
+    try {
+      await autoLoginFromEnv('startup');
+    } catch (e) {
+      console.error('[hdhive-api] auto login failed:', e.message);
+    }
+  }
+
+  if (config.autoWarmup && hasCompleteLoginCookie(config.defaultCookie)) {
     console.log('[hdhive-api] auto warmup...');
     try {
       const client = getClient();
@@ -1108,6 +1416,7 @@ app.listen(config.port, '0.0.0.0', async () => {
 async function shutdown() {
   console.log('[hdhive-api] shutting down...');
   if (state.client) await state.client.close().catch(() => {});
+  if (dbState.pool) await dbState.pool.end().catch(() => {});
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);

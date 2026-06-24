@@ -33,6 +33,11 @@ services:
       # 可选：默认 cookie（如果设置，会自动保存到数据库）
       - HDHIVE_COOKIE=${HDHIVE_COOKIE:-}
 
+      # 可选：cookie 缺失/不完整时自动登录并保存到数据库
+      - HDHIVE_USERNAME=${HDHIVE_USERNAME:-}
+      - HDHIVE_PASSWORD=${HDHIVE_PASSWORD:-}
+      - AUTO_LOGIN=${AUTO_LOGIN:-true}
+
       # 加密密钥（用于数据库存储 cookie）
       - BRIDGE_STATE_SECRET=${BRIDGE_STATE_SECRET:-change-me-in-production}
 

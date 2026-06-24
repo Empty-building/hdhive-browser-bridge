@@ -173,6 +173,10 @@ function isVerificationRequiredMessage(message) {
   return /验证码|验证|captcha|verification/i.test(String(message || ''));
 }
 
+function isMissingResponseSignatureMessage(message) {
+  return /X-HDH-RSig|RSig|响应携带.*签名头|未收到.*签名头|Missing X-HDH-RSig/i.test(String(message || ''));
+}
+
 function getCheckinChallenge(response) {
   const data = response?.data?.data;
   if (!data || typeof data !== 'object') return null;
@@ -458,17 +462,149 @@ export class HdhiveClient {
       const q = qs.toString();
       if (q) fullPath += (path.includes('?') ? '&' : '?') + q;
     }
-    const args = JSON.stringify({ method, fullPath, body: body == null ? null : body });
-    const fn = `(${REGISTER_AND_RUN})(${args})`;
-    try {
-      return await this._page.evaluate(fn);
-    } catch (e) {
-      if (/WASM|wasm|SignedFetchError|签名|加载失败/i.test(e.message || '')) {
-        await this._reloadPage();
-        return await this._page.evaluate(fn);
-      }
-      throw e;
+
+    const request = {
+      method,
+      fullPath,
+      body: body == null ? null : body,
+      targetPathname: (() => {
+        try {
+          return new URL(fullPath, this.baseUrl).pathname;
+        } catch {
+          return path.split('?')[0];
+        }
+      })()
+    };
+    const allowUnsignedResponseFallback = String(path).startsWith('/api/customer/');
+    let result = await this._runSignedCallWithCapture(request);
+
+    if (result.ok) {
+      return result.response;
     }
+
+    let message = result.error?.message || String(result.error || 'signed fetch failed');
+    if (allowUnsignedResponseFallback && isMissingResponseSignatureMessage(message)) {
+      const fallback = this._getUnsignedResponseFallback(result);
+      if (fallback) return fallback;
+    }
+
+    if (/WASM|wasm|SignedFetchError|加载失败/i.test(message || '')) {
+      await this._reloadPage();
+      result = await this._runSignedCallWithCapture(request);
+      if (result.ok) return result.response;
+
+      message = result.error?.message || String(result.error || 'signed fetch failed');
+      if (allowUnsignedResponseFallback && isMissingResponseSignatureMessage(message)) {
+        const fallback = this._getUnsignedResponseFallback(result);
+        if (fallback) return fallback;
+      }
+    }
+
+    const error = new Error(message);
+    error.name = result.error?.name || 'SignedFetchError';
+    error.details = result.error;
+    throw error;
+  }
+
+  async _runSignedCallWithCapture(request) {
+    return await this._page.evaluate(async ({ registerAndRunSource, request }) => {
+      const capturedFetchResponses = [];
+      const parseMaybeJson = (value) => {
+        if (!value) return null;
+        try {
+          return JSON.parse(value);
+        } catch {
+          return value;
+        }
+      };
+      const pickHeaders = (headers, names) => {
+        const picked = {};
+        for (const name of names) {
+          const value = headers?.get?.(name);
+          if (value) picked[name] = value;
+        }
+        return picked;
+      };
+      const matchesTargetUrl = (value) => {
+        let url;
+        try {
+          url = new URL(value?.url || value || '', location.origin);
+        } catch {
+          return false;
+        }
+        const target = request.targetPathname || request.fullPath;
+        return url.origin === location.origin && (
+          url.pathname === target
+          || url.pathname === `${target}/`
+        );
+      };
+
+      const originalFetch = window.fetch?.bind(window);
+      if (originalFetch) {
+        window.fetch = async (...args) => {
+          const response = await originalFetch(...args);
+          if (matchesTargetUrl(response.url || args[0])) {
+            const text = await response.clone().text().catch(() => '');
+            capturedFetchResponses.push({
+              url: response.url || String(args[0] || ''),
+              status: response.status,
+              ok: response.ok,
+              headers: pickHeaders(response.headers, ['content-type', 'x-hdh-rsig', 'x-hdh-rts']),
+              body: parseMaybeJson(text)
+            });
+          }
+          return response;
+        };
+      }
+
+      try {
+        const registerAndRun = eval(`(${registerAndRunSource})`);
+        const response = await registerAndRun({
+          method: request.method,
+          fullPath: request.fullPath,
+          body: request.body
+        });
+        return { ok: true, response, capturedFetchResponses };
+      } catch (error) {
+        return {
+          ok: false,
+          error: {
+            name: error?.name || '',
+            code: error?.code || '',
+            httpStatus: error?.httpStatus || error?.status || 0,
+            message: error?.message || error?.description || String(error),
+            responseStatus: error?.response?.status || 0,
+            responseData: error?.response?.data ?? null
+          },
+          capturedFetchResponses
+        };
+      } finally {
+        if (originalFetch) {
+          window.fetch = originalFetch;
+        }
+      }
+    }, { registerAndRunSource: REGISTER_AND_RUN, request });
+  }
+
+  _getUnsignedResponseFallback(result) {
+    const observed = [...(result?.capturedFetchResponses || [])]
+      .reverse()
+      .find(response => response?.ok && response.body !== undefined);
+    const responseDataFallback = result?.error?.responseData !== undefined && result?.error?.responseData !== null
+      ? {
+          status: result.error.responseStatus || 0,
+          ok: !result.error.responseStatus || Number(result.error.responseStatus) < 400,
+          body: result.error.responseData
+        }
+      : null;
+    const fallback = observed || responseDataFallback;
+    if (!fallback?.ok || fallback.body === undefined) return null;
+    return {
+      status: fallback.status || 200,
+      ok: true,
+      data: fallback.body ?? { success: true, message: 'request completed but response body was empty' },
+      warning: 'missing X-HDH-RSig; used captured same-origin response body'
+    };
   }
 
   async _browserFetchJson(path, { method = 'GET', body, query } = {}) {
