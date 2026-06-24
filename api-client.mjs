@@ -14,7 +14,8 @@ const REGISTER_AND_RUN = `
 async ({ method, fullPath, body }) => {
   let webpackRequire = window.__hdhiveRequire;
   if (!webpackRequire) {
-    window.webpackChunk_N_E.push([['__hdhive_probe__'], {}, (req) => { webpackRequire = req; window.__hdhiveRequire = req; }]);
+    const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+    chunk.push([['__hdhive_probe__'], {}, (req) => { webpackRequire = req; window.__hdhiveRequire = req; }]);
   }
   if (!webpackRequire) throw new Error('webpack require not found');
   if (!webpackRequire.m['9110']) {
@@ -424,6 +425,24 @@ export class HdhiveClient {
     } catch (e) {}
   }
 
+  async _ensureHdhiveRuntime() {
+    await this._ensureBrowser({ initialUrl: this.baseUrl });
+    if (!this._page.url().startsWith(this.baseUrl)) {
+      await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    }
+    const ready = await this._page.waitForFunction(
+      () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
+      { timeout: 5000 }
+    ).then(() => true).catch(() => false);
+    if (!ready) {
+      await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await this._page.waitForFunction(
+        () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
+        { timeout: 10000 }
+      ).catch(() => undefined);
+    }
+  }
+
   async _waitForMoviePageReady(timeoutMs = 12000) {
     const start = Date.now();
     let lastLength = 0;
@@ -452,7 +471,7 @@ export class HdhiveClient {
   }
 
   async call(method, path, { query, body } = {}) {
-    await this._ensureBrowser();
+    await this._ensureHdhiveRuntime();
     let fullPath = path;
     if (query) {
       const qs = new URLSearchParams();
@@ -1338,16 +1357,18 @@ export class HdhiveClient {
   }
 
   async _callCheckinServerAction({ verifyToken, isGambler = false } = {}) {
-    await this._ensureBrowser();
+    await this._ensureHdhiveRuntime();
     const actionId = '60529bb51b8032da8000e7c2d73b01e276a18422ea';
     return this._page.evaluate(async ({ actionId, verifyToken, isGambler }) => {
       let webpackRequire = window.__hdhiveRequire;
       if (!webpackRequire) {
-        window.webpackChunk_N_E.push([['__hdhive_action_call__'], {}, (req) => {
+        const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+        chunk.push([['__hdhive_action_call__'], {}, (req) => {
           webpackRequire = req;
           window.__hdhiveRequire = req;
         }]);
       }
+      if (!webpackRequire) throw new Error('webpack require not found');
       if (!webpackRequire.m['41607']) {
         try { await webpackRequire.e(5530); } catch {}
       }

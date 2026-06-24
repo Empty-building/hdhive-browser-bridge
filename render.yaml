@@ -27,5 +27,13 @@ services:
         sync: false
       - key: HDHIVE_PASSWORD
         sync: false
+      - key: CAPTCHA_AI_BASE_URL
+        sync: false
+      - key: CAPTCHA_AI_API_KEY
+        sync: false
+      - key: CAPTCHA_AI_MODEL
+        value: web2api/gemini-auto
+      - key: CAPTCHA_SOLVER
+        value: ai
       - key: BRIDGE_TOKEN
         generateValue: true

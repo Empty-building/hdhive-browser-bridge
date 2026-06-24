@@ -59,6 +59,12 @@ services:
       # 可选：是否启动时自动预热
       - AUTO_WARMUP=${AUTO_WARMUP:-true}
 
+      # 可选：签到验证码 AI 配置
+      - CAPTCHA_AI_BASE_URL=${CAPTCHA_AI_BASE_URL:-}
+      - CAPTCHA_AI_API_KEY=${CAPTCHA_AI_API_KEY:-}
+      - CAPTCHA_AI_MODEL=${CAPTCHA_AI_MODEL:-web2api/gemini-auto}
+      - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-}
+
     volumes:
       - hdhive-data:/tmp/hdhive-cache
 
