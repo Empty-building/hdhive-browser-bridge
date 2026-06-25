@@ -1524,7 +1524,15 @@ export class HdhiveClient {
     const includeUser = options?.includeUser !== false;
     const autoVerify = options?.autoVerify === true;
     const before = includeUser ? await this._getCurrentPointsSnapshot() : null;
-    let response = await this.call('POST', '/api/customer/user/checkin');
+    let response;
+    try {
+      response = await this.call('POST', '/api/customer/user/checkin');
+    } catch (e) {
+      if (!isMissingResponseSignatureMessage(e.message)) throw e;
+      response = await this._callCheckinServerAction({
+        isGambler: options?.isGambler === true
+      });
+    }
     let normalized = normalizeCheckinResult(response);
     let initialCheckin = null;
     let verification = null;
