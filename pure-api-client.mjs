@@ -940,6 +940,162 @@ export class PureHdhiveClient {
       raw: unlock.data
     };
   }
+
+  /**
+   * 拉 HTML 页面（不签名；cookie 可选）
+   */
+  async _fetchHtml(pathOrUrl) {
+    const url = pathOrUrl.startsWith('http')
+      ? pathOrUrl
+      : `${this.baseUrl}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
+    const res = await this._rawRequest(url, {
+      method: 'GET',
+      headers: {
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'cache-control': 'no-cache'
+      }
+    });
+    const html = res.body.toString('utf8');
+    return { status: res.status, ok: res.ok, headers: res.headers, html };
+  }
+
+  /**
+   * TMDB → 影巢内部 slug（无需登录）
+   * 从 /tmdb/movie|tv/:id HTML 的 NEXT_REDIRECT 解析
+   */
+  async resolveTmdbToInternal(tmdbId, type = 'movie') {
+    const mediaType = String(type || 'movie').toLowerCase() === 'tv' ? 'tv' : 'movie';
+    const id = String(tmdbId || '').trim();
+    if (!id) throw new Error('tmdbId is required');
+
+    const path = `/tmdb/${mediaType}/${id}`;
+    const { status, html } = await this._fetchHtml(path);
+    if (status >= 400) {
+      throw new Error(`resolve TMDB HTTP ${status} for ${path}`);
+    }
+
+    const redirect =
+      html.match(/NEXT_REDIRECT;replace;(\/(?:movie|tv)\/[A-Za-z0-9._~-]+);(\d+)/)?.[1] ||
+      html.match(/"digest":"NEXT_REDIRECT;replace;(\/(?:movie|tv)\/[A-Za-z0-9._~-]+);(\d+);?"/)?.[1] ||
+      html.match(/(\/(?:movie|tv)\/[a-f0-9]{32})/)?.[1];
+
+    if (!redirect) {
+      // 未登录有时也会直接给 redirect；若只有 login 则失败
+      const login = html.match(/\/login\?redirect=([^"\\]+)/)?.[1];
+      throw new Error(
+        `cannot resolve TMDB ${mediaType}/${id}` +
+          (login ? ` (got login redirect ${decodeURIComponent(login)})` : ' (no NEXT_REDIRECT in HTML)')
+      );
+    }
+
+    const m = redirect.match(/\/(movie|tv)\/([A-Za-z0-9._~-]+)/);
+    if (!m) throw new Error(`invalid redirect path: ${redirect}`);
+    const slug = m[2];
+    return {
+      type: m[1],
+      slug,
+      url: `${this.baseUrl}/${m[1]}/${slug}`,
+      path: `/${m[1]}/${slug}`,
+      tmdbId: id
+    };
+  }
+
+  /**
+   * 从 /movie|tv/:slug HTML 的 __next_f groupData 解析天翼资源列表（需登录 cookie）
+   */
+  async listCloud189FromMoviePage(movieInternalUrlOrSlug, type = 'movie') {
+    let path;
+    const raw = String(movieInternalUrlOrSlug || '');
+    if (/^https?:\/\//i.test(raw)) {
+      path = new URL(raw).pathname;
+    } else if (raw.startsWith('/')) {
+      path = raw;
+    } else if (raw) {
+      const mediaType = String(type || 'movie').toLowerCase() === 'tv' ? 'tv' : 'movie';
+      path = `/${mediaType}/${raw}`;
+    } else {
+      throw new Error('movie slug/url is required');
+    }
+
+    const { status, html } = await this._fetchHtml(path);
+    if (status >= 400) throw new Error(`movie page HTTP ${status} for ${path}`);
+
+    // 未登录会被塞到 login
+    if (/\/login\?redirect=/.test(html) && !/groupData/.test(html)) {
+      throw new Error('movie page requires login cookie (redirected to login)');
+    }
+
+    const groupData = extractNextGroupData(html);
+    if (!groupData) throw new Error('groupData not found in movie page HTML');
+
+    const items = groupData.groupData?.['189'] || groupData.groupData?.['cloud189'] || [];
+    const movieSlug = path.split('/').filter(Boolean)[1] || '';
+    const resources = items.map((r) => normalizeGroupResource(r, this.baseUrl));
+    return {
+      movieSlug,
+      movieUrl: `${this.baseUrl}${path}`,
+      websites: groupData.websites || [],
+      resources
+    };
+  }
+
+  /**
+   * 兼容 bridge: TMDB → 天翼资源列表（不消耗积分，不启动浏览器）
+   * 返回结构贴近 POST /hdhive/customer/media-resources
+   */
+  async mediaResourcesByTmdb(tmdbId, type = 'movie') {
+    const resolved = await this.resolveTmdbToInternal(tmdbId, type);
+    const listed = await this.listCloud189FromMoviePage(resolved.path, resolved.type);
+    const resources = listed.resources.map((r) => ({
+      id: r.slug,
+      slug: r.slug,
+      title: r.title,
+      size: r.size,
+      sizeFormatted: r.sizeFormatted || formatBytes(r.size),
+      points: r.points,
+      isFree: r.points === 0,
+      link: r.link || '',
+      code: r.code || '',
+      isUnlocked: Boolean(r.isUnlocked),
+      cloudType: 'cloud189',
+      uploader: r.uploader || '',
+      source: 'html-groupData',
+      movieId: String(tmdbId),
+      movieType: resolved.type,
+      remark: r.remark,
+      raw: r.raw
+    }));
+    return {
+      success: true,
+      resources,
+      movieSlug: resolved.slug,
+      movieUrl: resolved.url,
+      tmdbId: String(tmdbId),
+      type: resolved.type
+    };
+  }
+
+  /**
+   * 预览：列表 + 当前积分（不解锁）
+   */
+  async previewTmdb(tmdbId, type = 'movie') {
+    const list = await this.mediaResourcesByTmdb(tmdbId, type);
+    let currentPoints = null;
+    try {
+      const user = await this.getCurrentUser();
+      currentPoints =
+        user.data?.data?.user_meta?.points ??
+        user.data?.data?.points ??
+        null;
+    } catch {}
+    const costs = list.resources.map((r) => Number(r.points) || 0);
+    return {
+      ...list,
+      currentPoints,
+      totalCost: costs.reduce((a, b) => a + b, 0),
+      cheapestCost: costs.length ? Math.min(...costs) : 0
+    };
+  }
 }
 
 function decodeChunked(buf) {
@@ -957,6 +1113,143 @@ function decodeChunked(buf) {
     offset += size + 2; // data + CRLF
   }
   return Buffer.concat(out);
+}
+
+/** 只处理 JS 字符串转义，避免 unicode_escape 弄坏中文 */
+function unescapeJsString(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch !== '\\' || i + 1 >= s.length) {
+      out += ch;
+      continue;
+    }
+    const n = s[i + 1];
+    if (n === 'n') {
+      out += '\n';
+      i += 1;
+    } else if (n === 'r') {
+      out += '\r';
+      i += 1;
+    } else if (n === 't') {
+      out += '\t';
+      i += 1;
+    } else if (n === '"' || n === "'" || n === '\\' || n === '/') {
+      out += n;
+      i += 1;
+    } else if (n === 'u' && i + 5 < s.length) {
+      out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16));
+      i += 5;
+    } else {
+      out += n;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function extractJsonObject(text, startIdx) {
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(startIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * 从电影页 HTML 的 self.__next_f.push 中提取 groupData 对象
+ */
+function extractNextGroupData(html) {
+  const re = /<script[^>]*>self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)<\/script>/g;
+  let match;
+  while ((match = re.exec(html))) {
+    const raw = match[1];
+    if (!raw.includes('groupData')) continue;
+    const unescaped = unescapeJsString(raw);
+    const marker = unescaped.indexOf('{"websites"');
+    const start = marker >= 0 ? marker : unescaped.indexOf('{');
+    if (start < 0) continue;
+    const objText = extractJsonObject(unescaped, start);
+    if (!objText) continue;
+    try {
+      const data = JSON.parse(objText);
+      if (data?.groupData) return data;
+    } catch {
+      // try next push
+    }
+  }
+  return null;
+}
+
+function parseShareSizeToBytes(value) {
+  const text = String(value || '');
+  const matches = text.matchAll(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)\b/gi);
+  const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+  let best = 0;
+  for (const m of matches) {
+    const n = Number(m[1]) * (units[m[2].toUpperCase()] || 0);
+    if (Number.isFinite(n) && n > best) best = n;
+  }
+  return Math.round(best);
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
+}
+
+function normalizeGroupResource(r, baseUrl) {
+  const slug = r?.slug || String(r?.id || '');
+  const remark = String(r?.remark || '').trim();
+  const title = (remark || r?.title || '影巢天翼资源')
+    .replace(/\s*@\s*和谐点我[!！]?.*$/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sizeText = r?.share_size || r?.size || '';
+  const size = parseShareSizeToBytes(sizeText);
+  const points = Number(r?.unlock_points ?? r?.default_unlock_points ?? 0);
+  const uploader = r?.user?.nickname || r?.user?.username || '';
+  return {
+    id: slug,
+    slug,
+    title,
+    remark,
+    size,
+    sizeFormatted: size ? formatBytes(size) : String(sizeText || ''),
+    points: Number.isFinite(points) ? points : null,
+    isFree: points === 0,
+    isUnlocked: Boolean(r?.is_unlocked || r?.unlocked || r?.already_owned),
+    uploader,
+    link: '',
+    code: '',
+    pageUrl: slug ? `${baseUrl}/resource/189/${slug}` : '',
+    raw: r
+  };
 }
 
 /**
@@ -1109,15 +1402,36 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         2
       )
     );
-    const slug = process.argv[2];
-    if (slug) {
-      console.log('[pure] unlock', slug);
-      const u = await client.unlockByResourceSlug(slug);
+    const arg = process.argv[2];
+    if (arg && /^\d+$/.test(arg)) {
+      // node pure-api-client.mjs 568160 [movie|tv]
+      const type = process.argv[3] || 'movie';
+      console.log('[pure] media-resources tmdb', arg, type);
+      const list = await client.mediaResourcesByTmdb(arg, type);
+      console.log(JSON.stringify({
+        success: list.success,
+        movieSlug: list.movieSlug,
+        count: list.resources.length,
+        resources: list.resources.map((r) => ({
+          slug: r.slug,
+          title: r.title,
+          uploader: r.uploader,
+          sizeFormatted: r.sizeFormatted,
+          points: r.points,
+          isUnlocked: r.isUnlocked
+        }))
+      }, null, 2));
+    } else if (arg) {
+      console.log('[pure] unlock', arg);
+      const u = await client.unlockByResourceSlug(arg);
       console.log(JSON.stringify(u, null, 2).slice(0, 2000));
     } else {
       console.log('[pure] points-logs...');
       const logs = await client.getPointsLogs({ page: 1, page_size: 3 });
       console.log(JSON.stringify({ status: logs.status, ok: logs.ok, data: logs.data }, null, 2).slice(0, 1200));
+      console.log('[pure] resolve tmdb 568160...');
+      const resolved = await client.resolveTmdbToInternal('568160', 'movie');
+      console.log(resolved);
     }
   } catch (e) {
     console.error('[pure] FAILED', e.stack || e);
