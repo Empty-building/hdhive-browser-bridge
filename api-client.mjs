@@ -2242,15 +2242,17 @@ export class HdhiveClient {
    * 拦截第一次重定向（/tmdb/movie/{id} → /movie/{内部slug}）就停止
    */
   async resolveTmdbToInternal(tmdbId, type = 'movie', attempt = 1) {
+    const maxAttempt = 3;
+    // 主 page 优先
     if (this._ready && this._page) {
       try {
         return await this._resolveTmdbInPage(this._page, tmdbId, type);
       } catch (e) {
-        if (attempt < 2) {
-          await this._reloadPage();
+        if (attempt < maxAttempt) {
+          await this._reloadPage().catch(() => {});
           return this.resolveTmdbToInternal(tmdbId, type, attempt + 1);
         }
-        throw e;
+        // fall through to isolated context
       }
     }
 
@@ -2264,7 +2266,6 @@ export class HdhiveClient {
     await ctx.addInitScript(STEALTH_SCRIPT);
     await ctx.addInitScript(DISABLE_ANIMATION_SCRIPT);
     const page = await ctx.pages()[0] || await ctx.newPage();
-    // 拦截图片/统计加速
     await ctx.route('**/*', (route) => {
       const url = route.request().url();
       const rtype = route.request().resourceType();
@@ -2281,6 +2282,21 @@ export class HdhiveClient {
     }
   }
 
+  _extractTmdbRedirect(htmlOrText, type = 'movie') {
+    const blob = String(htmlOrText || '');
+    // Next redirect digest: NEXT_REDIRECT;replace;/movie/<slug>;307;
+    let m = blob.match(/NEXT_REDIRECT;replace;\/(movie|tv)\/([a-f0-9]{32});(\d{3});/i)
+      || blob.match(/\/(movie|tv)\/([a-f0-9]{32})/i);
+    if (!m) return null;
+    const resolvedType = (m[1] || type || 'movie').toLowerCase();
+    const slug = m[2];
+    return {
+      type: resolvedType,
+      slug,
+      url: `${this.baseUrl}/${resolvedType}/${slug}`
+    };
+  }
+
   async _resolveTmdbInPage(page, tmdbId, type = 'movie') {
     let resolvedSlug = null;
     let resolvedType = null;
@@ -2295,6 +2311,9 @@ export class HdhiveClient {
     const onResponse = (res) => {
       const req = res.request();
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) capture(res.url());
+      // 也从 Location 头抓
+      const loc = res.headers()?.location;
+      if (loc) capture(loc);
     };
     const onFrameNavigated = (frame) => {
       if (frame === page.mainFrame()) capture(frame.url());
@@ -2305,12 +2324,13 @@ export class HdhiveClient {
     page.on('framenavigated', onFrameNavigated);
     try {
       const tmdbUrl = `${this.baseUrl}/tmdb/${type}/${tmdbId}`;
-      if (/\/(movie|tv)\/[a-f0-9]{32}/.test(page.url())) {
+      if (/\/(movie|tv)\/[a-f0-9]{32}/.test(page.url()) || page.url().startsWith('about:blank') === false) {
+        // 从 about:blank 或脏页面进入更干净
         await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 3000 }).catch(() => {});
       }
-      const navPromise = page.goto(tmdbUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      const navPromise = page.goto(tmdbUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => e);
       const start = Date.now();
-      while (!resolvedSlug && Date.now() - start < 8000) {
+      while (!resolvedSlug && Date.now() - start < 10000) {
         await page.waitForTimeout(50);
       }
       if (resolvedSlug) {
@@ -2319,12 +2339,36 @@ export class HdhiveClient {
         return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
       }
 
-      await navPromise.catch(() => {});
+      const navResult = await navPromise.catch(() => null);
       capture(page.url());
-      if (!resolvedSlug) {
-        throw new Error(`cannot resolve TMDB ${type}/${tmdbId}`);
+      if (resolvedSlug) {
+        return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
       }
-      return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
+
+      // 关键兜底：很多时候 tmdb 页不跳转，直接吐 NEXT_REDIRECT digest HTML
+      let html = '';
+      try { html = await page.content(); } catch {}
+      let text = '';
+      try { text = await page.evaluate(() => document.body?.innerText || ''); } catch {}
+      const extracted = this._extractTmdbRedirect(`${html}\n${text}`, type);
+      if (extracted) {
+        if (page === this._page) this._pageNeedsMovieReload = true;
+        return extracted;
+      }
+
+      // 再等一会儿，可能慢跳转
+      const start2 = Date.now();
+      while (!resolvedSlug && Date.now() - start2 < 5000) {
+        await page.waitForTimeout(100);
+        capture(page.url());
+      }
+      if (resolvedSlug) {
+        return { type: resolvedType || type, slug: resolvedSlug, url: `${this.baseUrl}/${resolvedType || type}/${resolvedSlug}` };
+      }
+
+      const why = navResult?.message ? ` (${navResult.message.split('\n')[0]})` : '';
+      throw new Error(`cannot resolve TMDB ${type}/${tmdbId}${why}`);
+
     } finally {
       page.off('request', onRequest);
       page.off('response', onResponse);
@@ -2332,10 +2376,6 @@ export class HdhiveClient {
     }
   }
 
-  /**
-   * 从 movie 页面找 189 资源列表（无需登录，仅 DOM 爬取）
-   * 优化：只滚动 2 次（之前 6 次），因为我们只要 slug
-   */
   async findResourcesFromMoviePage(movieInternalUrl) {
     return this._withBusy(async () => {
     await this._ensureBrowser({ initialUrl: movieInternalUrl });
