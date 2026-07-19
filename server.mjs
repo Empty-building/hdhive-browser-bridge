@@ -533,37 +533,75 @@ async function listCookiesFromDb() {
 // ─────────────────── 全局串行队列（消除并发踩踏）───────────────────
 
 let actionChain = Promise.resolve();
+let actionChainVersion = 0;
+
+async function forceRecoverBrowser(reason = 'timeout') {
+  try {
+    if (state.client) {
+      await state.client.close().catch(() => {});
+      state.client = null;
+    }
+    state.warmupOk = false;
+    clearReadCache();
+    if (hasCompleteLoginCookie(config.defaultCookie)) {
+      const client = getClient(config.defaultCookie);
+      await client._ensureBrowser();
+      state.warmupAt = Date.now();
+      state.warmupOk = true;
+    }
+    console.warn(`[hdhive-api] browser recovered after ${reason}`);
+  } catch (e) {
+    console.error(`[hdhive-api] browser recover failed after ${reason}:`, e.message);
+  }
+}
 
 // 内部：原 withTimeout 逻辑（超时控制）
-async function _withTimeout(actionName, fn) {
+async function _withTimeout(actionName, fn, chainVersion) {
+  // 过期队列任务直接丢弃，避免超时后的僵尸任务继续占浏览器
+  if (chainVersion !== actionChainVersion) {
+    return { success: false, error: `action ${actionName} cancelled by newer queue epoch` };
+  }
   state.activeAction = { name: actionName, startedAt: Date.now() };
   let timeoutHandle;
+  let timedOut = false;
   try {
     const result = await Promise.race([
       Promise.resolve().then(fn),
       new Promise((_, reject) => {
-        timeoutHandle = setTimeout(
-          () => reject(new Error(`action ${actionName} timed out after ${config.actionTimeoutMs}ms`)),
-          config.actionTimeoutMs
-        );
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`action ${actionName} timed out after ${config.actionTimeoutMs}ms`));
+        }, config.actionTimeoutMs);
       })
     ]);
+    // 如果已经超时并切 epoch，结果作废
+    if (chainVersion !== actionChainVersion) {
+      return { success: false, error: `action ${actionName} cancelled by newer queue epoch` };
+    }
     state.lastSuccess = Date.now();
     state.totalCalls++;
     return { success: true, data: result };
   } catch (e) {
     state.lastError = e.message;
     state.failedCalls++;
+    if (timedOut) {
+      // 切 epoch，使当前僵尸任务后续结果全部失效，并重建浏览器
+      actionChainVersion += 1;
+      actionChain = Promise.resolve();
+      // 异步恢复，不阻塞当前响应
+      forceRecoverBrowser(`timeout:${actionName}`).catch(() => {});
+    }
     return { success: false, error: e.message };
   } finally {
     clearTimeout(timeoutHandle);
-    state.activeAction = null;
+    if (state.activeAction?.name === actionName) state.activeAction = null;
   }
 }
 
 // 外层：串行化包装（保证单 page 操作串行执行）
 async function withTimeout(actionName, fn) {
-  const run = actionChain.then(() => _withTimeout(actionName, fn));
+  const chainVersion = actionChainVersion;
+  const run = actionChain.then(() => _withTimeout(actionName, fn, chainVersion));
   // 队列不因单个任务失败而断裂
   actionChain = run.then(() => {}, () => {});
   return run;
@@ -1397,10 +1435,29 @@ app.post('/hdhive/unlock/share', async (req, res) => {
 });
 
 // 单独提取 189 网盘链接（resource slug）
+// 页面抓取失败时，回退到 unlock 合并路径（已解锁不扣费）
 app.get('/hdhive/resource/:slug/cloud189', async (req, res) => {
   const r = await withTimeout('resource/cloud189', async () => {
     const client = getClient(await getRequestCookieAsync(req));
-    return await client.getCloud189Links(req.params.slug);
+    const slug = req.params.slug;
+    let links = null;
+    try {
+      links = await client.getCloud189Links(slug);
+    } catch (e) {
+      links = { error: e.message };
+    }
+    if (links?.url && links?.accessCode) return links;
+
+    // 回退：走 unlock API（already_owned 不扣积分）再合并 access_code
+    try {
+      const unlock = await client.unlockResource(slug);
+      const merged = client._mergeCloud189FromUnlock(unlock, links || {});
+      if (merged?.url || merged?.accessCode) return merged;
+    } catch (e) {
+      if (links && !links.error) links.error = e.message;
+      else links = { error: e.message };
+    }
+    return links || { url: null, accessCode: null, fullText: null, error: 'no cloud189 link' };
   });
   res.status(r.success ? 200 : 500).json(r);
 });

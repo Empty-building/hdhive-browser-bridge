@@ -15,10 +15,25 @@ const SIGNED_FETCH_MODULE_IDS = [39154, 9110];
 
 const REGISTER_AND_RUN = `
 async ({ method, fullPath, body }) => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 页面刚从 about:blank 回来时，webpack runtime 可能还没挂上
+  for (let i = 0; i < 30 && !window.webpackChunk_N_E; i++) {
+    await sleep(100);
+  }
   let webpackRequire = window.__hdhiveRequire;
   if (!webpackRequire) {
     const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
     chunk.push([['__hdhive_probe__'], {}, (req) => { webpackRequire = req; window.__hdhiveRequire = req; }]);
+  }
+  if (!webpackRequire) {
+    // 再等一轮（某些导航时 probe 会丢）
+    for (let i = 0; i < 20 && !webpackRequire; i++) {
+      await sleep(100);
+      if (window.__hdhiveRequire) webpackRequire = window.__hdhiveRequire;
+      else if (window.webpackChunk_N_E) {
+        window.webpackChunk_N_E.push([['__hdhive_probe_retry_' + i], {}, (req) => { webpackRequire = req; window.__hdhiveRequire = req; }]);
+      }
+    }
   }
   if (!webpackRequire) throw new Error('webpack require not found');
 
@@ -354,40 +369,35 @@ const DISABLE_ANIMATION_SCRIPT = `
     setTimeout(mount, 1000);
   } catch {}
 
-  // 停掉 rAF / rIC 循环（首页 lottie / canvas 常用）
-  let rafSeq = 1;
-  const noopRaf = () => rafSeq++;
-  try { window.requestAnimationFrame = noopRaf; } catch {}
-  try { window.webkitRequestAnimationFrame = noopRaf; } catch {}
-  try { window.mozRequestAnimationFrame = noopRaf; } catch {}
-  try { window.cancelAnimationFrame = () => {}; } catch {}
+  // 降频 rAF：最多约 2fps，避免首页动画空转，但不彻底打断框架调度
   try {
-    if (window.requestIdleCallback) {
-      window.requestIdleCallback = (cb) => setTimeout(() => {
-        try { cb({ didTimeout: true, timeRemaining: () => 0 }); } catch {}
-      }, 1000);
-      window.cancelIdleCallback = (id) => clearTimeout(id);
-    }
+    const nativeRaf = window.requestAnimationFrame.bind(window);
+    const nativeCaf = window.cancelAnimationFrame.bind(window);
+    let last = 0;
+    let seq = 1;
+    const ids = new Map();
+    window.requestAnimationFrame = (cb) => {
+      const id = seq++;
+      const now = Date.now();
+      const wait = Math.max(0, 500 - (now - last));
+      const timer = setTimeout(() => {
+        ids.delete(id);
+        last = Date.now();
+        try { cb(performance.now()); } catch {}
+      }, wait);
+      ids.set(id, timer);
+      return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+      const timer = ids.get(id);
+      if (timer) clearTimeout(timer);
+      ids.delete(id);
+      try { nativeCaf(id); } catch {}
+    };
   } catch {}
 
-  // 限制 setInterval / setTimeout 高频动画
-  try {
-    const nativeSetInterval = window.setInterval.bind(window);
-    window.setInterval = (fn, delay, ...args) => {
-      const ms = Number(delay);
-      const safeDelay = Number.isFinite(ms) && ms > 0 && ms < 50 ? 1000 : delay;
-      return nativeSetInterval(fn, safeDelay, ...args);
-    };
-  } catch {}
-  try {
-    const nativeSetTimeout = window.setTimeout.bind(window);
-    window.setTimeout = (fn, delay, ...args) => {
-      const ms = Number(delay);
-      // 0/极短 timeout 常见于动画调度，抬到 50ms 减少刷屏
-      const safeDelay = Number.isFinite(ms) && ms >= 0 && ms < 8 ? 50 : delay;
-      return nativeSetTimeout(fn, safeDelay, ...args);
-    };
-  } catch {}
+  // 注意：不要 monkey-patch setTimeout/setInterval。
+  // Next.js / webpack 依赖 0ms timer 调度 chunk，改了会导致 webpack require not found。
 
   // 冻结 document.timeline / Web Animations
   try {
@@ -881,7 +891,8 @@ export class HdhiveClient {
     })();
     if (!onSite) {
       await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await this._page.waitForTimeout(300).catch(() => undefined);
+      await this._page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => undefined);
+      await this._page.waitForTimeout(800).catch(() => undefined);
       if (this.bindSecret) {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
@@ -890,7 +901,7 @@ export class HdhiveClient {
     try {
       ready = await this._page.waitForFunction(
         () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
-        { timeout: 5000 }
+        { timeout: 12000 }
       ).then(() => true).catch(() => false);
     } catch {
       ready = false;
@@ -902,16 +913,21 @@ export class HdhiveClient {
         await this._ensureBrowser({ initialUrl: this.baseUrl });
       } else {
         await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-        await this._page.waitForTimeout(300).catch(() => undefined);
+        await this._page.waitForTimeout(1000).catch(() => undefined);
       }
       if (this.bindSecret) {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
       await this._page.waitForFunction(
         () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
-        { timeout: 10000 }
+        { timeout: 15000 }
       ).catch(() => undefined);
     }
+    // 清掉旧的 require 缓存，强制 REGISTER_AND_RUN 重新 probe
+    await this._page.evaluate(() => {
+      window.__hdhiveRequire = null;
+      window.__hdhiveHookRegistered = false;
+    }).catch(() => undefined);
   }
 
   async _waitForMoviePageReady(timeoutMs = 12000) {
@@ -2404,10 +2420,12 @@ export class HdhiveClient {
         const text = (card?.innerText || anchor.innerText || anchor.textContent || '').trim();
         const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
         const pointsMatch = text.match(/(\d+)\s*积分/);
+        const isUnlockedCard = /已解锁|查看链接|复制链接/.test(text);
         const isFree = /(^|\n|\s)免费($|\n|\s)/.test(text)
           || lines.some((line) => line === '免费')
-          || (!pointsMatch && /^免费/.test(text));
-        const unlockPoints = pointsMatch ? Number(pointsMatch[1]) : (isFree ? 0 : null);
+          || (!pointsMatch && /^免费/.test(text))
+          || (isUnlockedCard && !pointsMatch);
+        const unlockPoints = pointsMatch ? Number(pointsMatch[1]) : (isFree || isUnlockedCard ? 0 : null);
         const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
         const accessCode = (text.match(/(?:访问码|提取码)[：:\s]*([A-Za-z0-9]{4})/) || [])[1] || '';
 
