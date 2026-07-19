@@ -33,10 +33,17 @@ services:
       # 可选：默认 cookie（如果设置，会自动保存到数据库）
       - HDHIVE_COOKIE=${HDHIVE_COOKIE:-}
 
+      # 可选：登录后的 bindSecret（2026-07 改版后必须，否则 customer API 401）
+      - HDHIVE_BIND_SECRET=${HDHIVE_BIND_SECRET:-}
+
       # 可选：cookie 缺失/不完整时自动登录并保存到数据库
       - HDHIVE_USERNAME=${HDHIVE_USERNAME:-}
       - HDHIVE_PASSWORD=${HDHIVE_PASSWORD:-}
       - AUTO_LOGIN=${AUTO_LOGIN:-true}
+
+      # 代理：直连被 Cloudflare 拦时必须设，例如 socks5://host:1080
+      - HDHIVE_PROXY=${HDHIVE_PROXY:-}
+      - BROWSER_PROXY=${HDHIVE_PROXY:-}
 
       # 加密密钥（用于数据库存储 cookie）
       - BRIDGE_STATE_SECRET=${BRIDGE_STATE_SECRET:-change-me-in-production}
