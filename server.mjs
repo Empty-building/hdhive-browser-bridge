@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { HdhiveClient, STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT, DISABLE_ANIMATION_SCRIPT } from './api-client.mjs';
+import { PureHdhiveClient } from './pure-api-client.mjs';
 
 const config = {
   port: Number(process.env.PORT || 10000),
@@ -25,6 +26,10 @@ const config = {
   actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 180_000),
   // 是否启用自动 warmup
   autoWarmup: process.env.AUTO_WARMUP !== 'false',
+  // hybrid 模式下是否仍预热浏览器（默认 false：pure 就绪即可对外）
+  autoWarmupBrowser: process.env.AUTO_WARMUP_BROWSER === 'true',
+  // pure-api 优先；失败再回落浏览器。设 HYBRID_MODE=browser 可强制只走浏览器
+  hybridMode: String(process.env.HYBRID_MODE || 'auto').toLowerCase(), // auto | pure | browser
   // cookie 不完整时，是否允许用 HDHIVE_USERNAME/HDHIVE_PASSWORD 自动登录
   autoLogin: process.env.AUTO_LOGIN !== 'false',
   // 只读查询短缓存 TTL，默认 60 秒；设为 0 可关闭
@@ -48,11 +53,17 @@ const config = {
 const state = {
   startedAt: Date.now(),
   client: null,
+  pureClient: null,
+  pureCookie: '',
+  pureReady: false,
+  lastEngine: null, // pure | browser
   bindSecret: String(process.env.HDHIVE_BIND_SECRET || ''),
   lastSuccess: null,
   lastError: null,
   totalCalls: 0,
   failedCalls: 0,
+  pureCalls: 0,
+  pureFallbacks: 0,
   warmupAt: null,
   warmupOk: false,
   activeAction: null,
@@ -73,7 +84,26 @@ app.use((req, res, next) => {
   next();
 });
 
-// 获取或创建 client（带 cookie）
+function getBindSecret() {
+  if (process.env.HDHIVE_BIND_SECRET) return String(process.env.HDHIVE_BIND_SECRET).trim();
+  if (state.bindSecret) return String(state.bindSecret).trim();
+  try {
+    if (fs.existsSync('/tmp/hdhive-bind-secret.txt')) {
+      return fs.readFileSync('/tmp/hdhive-bind-secret.txt', 'utf8').trim();
+    }
+  } catch {}
+  return '';
+}
+
+function preferPure() {
+  return config.hybridMode !== 'browser';
+}
+
+function forceBrowserOnly() {
+  return config.hybridMode === 'browser';
+}
+
+// 获取或创建浏览器 client（Playwright）
 function getClient(cookieOverride) {
   const cookie = cookieOverride || config.defaultCookie;
   if (!cookie) {
@@ -89,7 +119,7 @@ function getClient(cookieOverride) {
     headless: config.headless,
     userAgent: config.userAgent,
     proxy: config.browserProxy,
-    bindSecret: process.env.HDHIVE_BIND_SECRET || state.bindSecret || '',
+    bindSecret: getBindSecret(),
     captchaAiBaseUrl: config.captchaAiBaseUrl,
     captchaAiApiKey: config.captchaAiApiKey,
     captchaAiModel: config.captchaAiModel,
@@ -103,6 +133,75 @@ function getClient(cookieOverride) {
     state.client = new HdhiveClient(clientOptions);
   }
   return state.client;
+}
+
+// 获取或创建 pure WASM client（无浏览器）
+function getPureClient(cookieOverride) {
+  const cookie = cookieOverride || config.defaultCookie;
+  if (!cookie) {
+    throw new Error('no cookie available: set HDHIVE_COOKIE env or pass cookie in body/header');
+  }
+  const missingLoginCookies = getMissingLoginCookieNames(cookie);
+  if (missingLoginCookies.length > 0) {
+    throw new Error(`cookie is incomplete: missing ${missingLoginCookies.join(', ')}; re-login or set a full HDHIVE_COOKIE`);
+  }
+  const bindSecret = getBindSecret();
+  if (!state.pureClient || state.pureCookie !== cookie) {
+    state.pureClient = new PureHdhiveClient({
+      baseUrl: config.baseUrl,
+      cookie,
+      bindSecret,
+      proxy: config.browserProxy,
+      userAgent: config.userAgent
+    });
+    state.pureCookie = cookie;
+    state.pureReady = false;
+  } else if (bindSecret && state.pureClient.bindSecret !== bindSecret) {
+    state.pureClient.bindSecret = bindSecret;
+    state.pureClient.session = null;
+  }
+  return state.pureClient;
+}
+
+async function ensurePureReady(cookieOverride) {
+  const pure = getPureClient(cookieOverride);
+  if (!state.pureReady || !pure.session) {
+    await pure.handshake({ force: !pure.session });
+    state.pureReady = true;
+  }
+  return pure;
+}
+
+/**
+ * pure 优先，失败回落浏览器。对外路由形状不变。
+ * @returns {Promise<{result:any, engine:'pure'|'browser'}>}
+ */
+async function withEngine(actionName, {
+  pure,
+  browser,
+  cookie,
+  allowPure = true
+} = {}) {
+  const canPure = allowPure && preferPure() && typeof pure === 'function' && !forceBrowserOnly();
+  if (canPure) {
+    try {
+      await ensurePureReady(cookie);
+      const result = await pure(getPureClient(cookie));
+      state.lastEngine = 'pure';
+      state.pureCalls += 1;
+      return { result, engine: 'pure' };
+    } catch (e) {
+      state.pureFallbacks += 1;
+      console.warn(`[hybrid] ${actionName} pure failed → browser: ${e.message}`);
+      if (config.hybridMode === 'pure') throw e;
+    }
+  }
+  if (typeof browser !== 'function') {
+    throw new Error(`${actionName}: no browser fallback available`);
+  }
+  const result = await browser(getClient(cookie));
+  state.lastEngine = 'browser';
+  return { result, engine: 'browser' };
 }
 
 // 工具函数：获取请求 cookie（优先级：body.cookie > header > env > database）
@@ -610,8 +709,13 @@ async function withTimeout(actionName, fn) {
 // ─────────────────── 生命周期接口 ───────────────────
 
 // 健康检查（无需 token）
+// hybrid: pure 就绪即可 ready；浏览器仅在需要时预热
 app.get('/health', async (req, res) => {
-  const ready = Boolean(state.client && state.warmupOk);
+  const browserReady = Boolean(state.client && state.warmupOk);
+  const pureReady = Boolean(state.pureReady || (preferPure() && hasCompleteLoginCookie(config.defaultCookie)));
+  const ready = forceBrowserOnly()
+    ? browserReady
+    : (pureReady || browserReady);
   res.status(200).json({
     success: true,
     ready,
@@ -621,7 +725,15 @@ app.get('/health', async (req, res) => {
     failedCalls: state.failedCalls,
     lastSuccess: state.lastSuccess,
     lastError: state.lastError,
-    activeAction: state.activeAction?.name || null
+    activeAction: state.activeAction?.name || null,
+    hybrid: {
+      mode: config.hybridMode,
+      pureReady: state.pureReady,
+      browserReady,
+      lastEngine: state.lastEngine,
+      pureCalls: state.pureCalls,
+      pureFallbacks: state.pureFallbacks
+    }
   });
 });
 
@@ -639,6 +751,10 @@ app.get('/metrics', (req, res) => {
       lastError: state.lastError,
       warmupAt: state.warmupAt,
       warmupOk: state.warmupOk,
+      pureReady: state.pureReady,
+      lastEngine: state.lastEngine,
+      pureCalls: state.pureCalls,
+      pureFallbacks: state.pureFallbacks,
       activeAction: state.activeAction,
       readCache: {
         enabled: Boolean(config.readCacheTtlMs),
@@ -648,6 +764,8 @@ app.get('/metrics', (req, res) => {
       config: {
         port: config.port,
         baseUrl: config.baseUrl,
+        hybridMode: config.hybridMode,
+        autoWarmupBrowser: config.autoWarmupBrowser,
         hasToken: Boolean(config.bridgeToken),
         hasDefaultCookie: Boolean(config.defaultCookie),
         hasCompleteDefaultCookie: hasCompleteLoginCookie(config.defaultCookie),
@@ -688,9 +806,13 @@ app.post('/warmup', async (req, res) => {
 // 当前用户
 app.get('/hdhive/customer/current', async (req, res) => {
   const r = await withTimeout('customer/current', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    const result = await client.getCurrentUser();
-    return { ...result, payload: result.data };
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('customer/current', {
+      cookie,
+      pure: (c) => c.getCurrentUser(),
+      browser: (c) => c.getCurrentUser()
+    });
+    return { ...result, payload: result.data, engine: state.lastEngine };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -698,18 +820,23 @@ app.get('/hdhive/customer/current', async (req, res) => {
 // 积分日志
 app.get('/hdhive/customer/points-logs', async (req, res) => {
   const r = await withTimeout('customer/points-logs', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    const result = await client.getPointsLogs(req.query);
-    return { ...result, payload: result.data };
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('customer/points-logs', {
+      cookie,
+      pure: (c) => c.getPointsLogs(req.query),
+      browser: (c) => c.getPointsLogs(req.query)
+    });
+    return { ...result, payload: result.data, engine: state.lastEngine };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
 
 // 签到
+// 有验证码自动求解时必须走浏览器；纯 API 只用于无验证码/已签到探测
 app.post('/hdhive/customer/checkin', async (req, res) => {
   const r = await withTimeout('customer/checkin', async () => {
     clearReadCache();
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const includeUserValue = req.body?.includeUser ?? req.query?.includeUser;
     const includeUser = !['false', '0', 'no'].includes(String(includeUserValue ?? '').toLowerCase());
     const autoVerifyValue = req.body?.autoVerify ?? req.query?.autoVerify;
@@ -723,8 +850,21 @@ app.post('/hdhive/customer/checkin', async (req, res) => {
     const verificationSolver = ['ai', 'auto', 'heuristic'].includes(String(verificationSolverValue || '').toLowerCase())
       ? String(verificationSolverValue).toLowerCase()
       : undefined;
-    const result = await client.checkin({ includeUser, autoVerify, verificationAttempts, verificationSolver });
-    return { ...result, payload: result.data };
+
+    // 需要验证码 AI/截图时强制浏览器
+    if (autoVerify) {
+      const client = getClient(cookie);
+      const result = await client.checkin({ includeUser, autoVerify, verificationAttempts, verificationSolver });
+      state.lastEngine = 'browser';
+      return { ...result, payload: result.data, engine: 'browser' };
+    }
+
+    const { result } = await withEngine('customer/checkin', {
+      cookie,
+      pure: (c) => c.checkin(req.body || {}),
+      browser: (c) => c.checkin({ includeUser, autoVerify, verificationAttempts, verificationSolver })
+    });
+    return { ...result, payload: result.data, engine: state.lastEngine };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -732,8 +872,13 @@ app.post('/hdhive/customer/checkin', async (req, res) => {
 // 未读消息数
 app.get('/hdhive/customer/messages/unread-count', async (req, res) => {
   const r = await withTimeout('customer/messages/unread-count', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.getUnreadCount();
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('customer/messages/unread-count', {
+      cookie,
+      pure: (c) => c.getUnreadCount(),
+      browser: (c) => c.getUnreadCount()
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -741,8 +886,13 @@ app.get('/hdhive/customer/messages/unread-count', async (req, res) => {
 // 我的播放列表
 app.get('/hdhive/customer/playlists/my', async (req, res) => {
   const r = await withTimeout('customer/playlists/my', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.call('GET', '/api/customer/playlists/my', { query: req.query });
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('customer/playlists/my', {
+      cookie,
+      pure: (c) => c.getPlaylists(req.query),
+      browser: (c) => c.call('GET', '/api/customer/playlists/my', { query: req.query })
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -750,72 +900,92 @@ app.get('/hdhive/customer/playlists/my', async (req, res) => {
 // 订阅检查
 app.post('/hdhive/customer/subscriptions/check', async (req, res) => {
   const r = await withTimeout('customer/subscriptions/check', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.call('GET', '/api/customer/subscriptions/check', {
-      query: req.body?.query || req.body
+    const cookie = await getRequestCookieAsync(req);
+    const query = req.body?.query || req.body;
+    const { result } = await withEngine('customer/subscriptions/check', {
+      cookie,
+      pure: (c) => c.call('GET', '/api/customer/subscriptions/check', { query }),
+      browser: (c) => c.call('GET', '/api/customer/subscriptions/check', { query })
     });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
 
 // 资源详情
 // ⭐ 资源详情（兼容 cloud189-auto-save 期望的格式，含 link/code）
+// pure：优先 unlock API 拿 link/code（已拥有不扣费）；浏览器：可再刮页面
 app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
   const r = await withTimeout('customer/resources', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const slug = req.params.resourceId;
 
-    // 1. API 查询
-    let apiData = null;
-    try {
-      const r = await client.getResource(slug);
-      apiData = r.data?.data;
-    } catch {}
-
-    // 2. 爬 189 链接（已解锁的话能拿到）
-    let cloud189 = null;
-    try {
-      cloud189 = await client.getCloud189Links(slug);
-    } catch {}
-
-    const link = cloud189?.url || apiData?.url || '';
-    const code = cloud189?.accessCode || apiData?.access_code || '';
-    const isUnlocked = Boolean(cloud189?.url) || apiData?.is_unlocked || false;
-    const unlockPoints = apiData?.unlock_points ?? apiData?.default_unlock_points ?? (apiData?.is_free ? 0 : null);
-
-    return {
-      // cloud189-auto-save 期望
-      link,
-      code,
-      accessCode: code,
-      fullUrl: link && code ? `${link}（访问码：${code}）` : link,
-      // 嵌套 resources
-      resources: [{
-        id: slug,
-        slug,
-        title: apiData?.title || '未命名资源',
-        cloudType: 'cloud189',
+    const buildFromUnlock = (unlockLike, apiData = null) => {
+      const data = unlockLike?.data?.data || unlockLike?.data || unlockLike || {};
+      const link = data.url || data.link || unlockLike?.link || '';
+      const code = data.access_code || data.accessCode || unlockLike?.accessCode || unlockLike?.code || '';
+      const isUnlocked = Boolean(link || data.already_owned || unlockLike?.ok);
+      const unlockPoints = apiData?.unlock_points ?? apiData?.default_unlock_points ?? (apiData?.is_free ? 0 : null);
+      return {
         link,
         code,
         accessCode: code,
-        size: apiData?.share_size || 0,
-        sizeFormatted: formatSize(apiData?.share_size || 0),
-        points: unlockPoints,
-        isFree: unlockPoints === 0,
-        isUnlocked,
-        movieId: apiData?.movie_id,
-        tvId: apiData?.tv_id,
-        uploader: apiData?.user || {},
-        createdAt: apiData?.created_at
-      }],
-      detail: {
-        link,
-        code,
-        accessCode: code
-      },
-      payload: apiData,
-      raw: apiData
+        fullUrl: data.full_url || (link && code ? `${link}（访问码：${code}）` : link),
+        resources: [{
+          id: slug,
+          slug,
+          title: apiData?.title || '未命名资源',
+          cloudType: 'cloud189',
+          link,
+          code,
+          accessCode: code,
+          size: apiData?.share_size || 0,
+          sizeFormatted: formatSize(apiData?.share_size || 0),
+          points: unlockPoints,
+          isFree: unlockPoints === 0,
+          isUnlocked,
+          movieId: apiData?.movie_id,
+          tvId: apiData?.tv_id,
+          uploader: apiData?.user || {},
+          createdAt: apiData?.created_at
+        }],
+        detail: { link, code, accessCode: code },
+        payload: apiData || data,
+        raw: apiData || unlockLike?.raw || data,
+        engine: state.lastEngine
+      };
     };
+
+    const { result } = await withEngine('customer/resources', {
+      cookie,
+      pure: async (c) => {
+        // 详情 API 常 403；直接 unlock（already_owned 不扣费）拿链接
+        const unlocked = await c.unlockByResourceSlug(slug);
+        return buildFromUnlock(unlocked);
+      },
+      browser: async (c) => {
+        let apiData = null;
+        try {
+          const detail = await c.getResource(slug);
+          apiData = detail.data?.data;
+        } catch {}
+        let cloud189 = null;
+        try {
+          cloud189 = await c.getCloud189Links(slug);
+        } catch {}
+        if (!(cloud189?.url && cloud189?.accessCode)) {
+          try {
+            const unlock = await c.unlockResource(slug);
+            cloud189 = c._mergeCloud189FromUnlock?.(unlock, cloud189 || {}) || cloud189;
+            if (!apiData) apiData = unlock.data?.data || null;
+          } catch {}
+        }
+        const link = cloud189?.url || apiData?.url || '';
+        const code = cloud189?.accessCode || apiData?.access_code || '';
+        return buildFromUnlock({ link, code, accessCode: code, data: { data: apiData } }, apiData);
+      }
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -824,67 +994,100 @@ app.get('/hdhive/customer/resources/:resourceId', async (req, res) => {
 app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
   const r = await withTimeout('customer/resources/unlock', async () => {
     clearReadCache();
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const slug = req.params.resourceId;
 
-    // 1. 调用影巢 unlock API
-    const unlock = await client.unlockResource(slug);
-
-    // 2. 立即获取 189 网盘链接（解锁后才能拿）
-    let cloud189 = null;
-    try {
-      cloud189 = await client.getCloud189Links(slug);
-    } catch (e) {
-      console.warn('[unlock] getCloud189Links failed:', e.message);
-    }
-
-    // 3. 解析 access_code（解锁返回的 url 字段包含）
-    const apiData = unlock.data?.data || {};
-    const shareUrl = apiData.url || cloud189?.url || '';
-    // 优先用 unlock API 的 access_code，页面抓取经常丢码
-    const accessCode = apiData.access_code || apiData.accessCode || cloud189?.accessCode || '';
-    const fullUrl = apiData.full_url
-      || (shareUrl && accessCode ? `${shareUrl}（访问码：${accessCode}）` : shareUrl);
-
-    return {
-      // cloud189-auto-save 期望的字段
-      link: shareUrl,
-      code: accessCode,
-      fullUrl,
-      accessCode,
-      // 嵌套 resources 字段（cloud189-auto-save 会从这读）
-      resources: cloud189?.url ? [{
-        id: slug,
-        slug,
-        title: '已解锁资源',
-        cloudType: 'cloud189',
-        link: shareUrl,
-        code: accessCode,
-        accessCode,
-        isUnlocked: true,
-        size: 0,
-        points: 0,
-        isFree: true
-      }] : [],
-      detail: cloud189?.url ? [{
-        id: slug,
-        slug,
-        title: '已解锁资源',
-        cloudType: 'cloud189',
-        link: shareUrl,
-        code: accessCode,
-        accessCode,
-        isUnlocked: true
-      }] : [],
-      payload: {
-        link: shareUrl,
-        code: accessCode,
-        fullUrl
+    const { result } = await withEngine('customer/resources/unlock', {
+      cookie,
+      pure: async (c) => {
+        const unlocked = await c.unlockByResourceSlug(slug);
+        const shareUrl = unlocked.link || '';
+        const accessCode = unlocked.accessCode || unlocked.code || '';
+        const fullUrl = unlocked.fullUrl
+          || (shareUrl && accessCode ? `${shareUrl}（访问码：${accessCode}）` : shareUrl);
+        return {
+          link: shareUrl,
+          code: accessCode,
+          fullUrl,
+          accessCode,
+          resources: shareUrl ? [{
+            id: slug,
+            slug,
+            title: '已解锁资源',
+            cloudType: 'cloud189',
+            link: shareUrl,
+            code: accessCode,
+            accessCode,
+            isUnlocked: true,
+            size: 0,
+            points: 0,
+            isFree: true
+          }] : [],
+          detail: shareUrl ? [{
+            id: slug,
+            slug,
+            title: '已解锁资源',
+            cloudType: 'cloud189',
+            link: shareUrl,
+            code: accessCode,
+            accessCode,
+            isUnlocked: true
+          }] : [],
+          payload: { link: shareUrl, code: accessCode, fullUrl },
+          raw: unlocked.raw,
+          message: unlocked.raw?.message || 'unlock done',
+          engine: 'pure'
+        };
       },
-      // 原始信息
-      raw: unlock.data,
-      message: unlock.data?.message || 'unlock done'
-    };
+      browser: async (c) => {
+        const unlock = await c.unlockResource(slug);
+        let cloud189 = null;
+        try {
+          cloud189 = await c.getCloud189Links(slug);
+        } catch (e) {
+          console.warn('[unlock] getCloud189Links failed:', e.message);
+        }
+        const apiData = unlock.data?.data || {};
+        const shareUrl = apiData.url || cloud189?.url || '';
+        const accessCode = apiData.access_code || apiData.accessCode || cloud189?.accessCode || '';
+        const fullUrl = apiData.full_url
+          || (shareUrl && accessCode ? `${shareUrl}（访问码：${accessCode}）` : shareUrl);
+        return {
+          link: shareUrl,
+          code: accessCode,
+          fullUrl,
+          accessCode,
+          resources: (shareUrl || cloud189?.url) ? [{
+            id: slug,
+            slug,
+            title: '已解锁资源',
+            cloudType: 'cloud189',
+            link: shareUrl,
+            code: accessCode,
+            accessCode,
+            isUnlocked: true,
+            size: 0,
+            points: 0,
+            isFree: true
+          }] : [],
+          detail: (shareUrl || cloud189?.url) ? [{
+            id: slug,
+            slug,
+            title: '已解锁资源',
+            cloudType: 'cloud189',
+            link: shareUrl,
+            code: accessCode,
+            accessCode,
+            isUnlocked: true
+          }] : [],
+          payload: { link: shareUrl, code: accessCode, fullUrl },
+          raw: unlock.data,
+          message: unlock.data?.message || 'unlock done',
+          engine: 'browser'
+        };
+      }
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -892,8 +1095,13 @@ app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
 // 检查资源
 app.post('/hdhive/customer/check/resource', async (req, res) => {
   const r = await withTimeout('customer/check/resource', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.checkResource(req.body?.url);
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('customer/check/resource', {
+      cookie,
+      pure: (c) => c.checkResource(req.body?.url),
+      browser: (c) => c.checkResource(req.body?.url)
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -914,63 +1122,69 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
 
     // in-flight 去重：同一 cacheKey 并发只跑一次，共享结果
     return dedupe(cacheKey, async () => {
-      const client = getClient(cookie);
-
-      // 1. 解析 TMDB → 内部 URL（无需登录）
-      const resolved = await client.resolveTmdbToInternal(tmdbId, type);
-
-      // 2. 找资源列表
-      const resources = await client.findResourcesFromMoviePage(resolved.url);
-
-      // 3. 对每个资源查积分 + 尝试拿 189 链接（不消耗积分，但 getCloud189Links 需要已解锁）
-      const enriched = [];
-      for (const r of resources) {
-        let info = {};
-        let infoError = null;
-        try {
-          info = await client.getResourceUnlockInfo(r);
-        } catch (e) {
-          infoError = e.message.slice(0, 100);
+      const { result, engine } = await withEngine('customer/media-resources', {
+        cookie,
+        pure: async (c) => {
+          const list = await c.mediaResourcesByTmdb(tmdbId, type);
+          return {
+            resources: list.resources,
+            movieSlug: list.movieSlug,
+            movieUrl: list.movieUrl,
+            tmdbId,
+            type: list.type || type,
+            cache: { hit: false, ttlMs: config.readCacheTtlMs },
+            engine: 'pure'
+          };
+        },
+        browser: async (c) => {
+          const resolved = await c.resolveTmdbToInternal(tmdbId, type);
+          const resources = await c.findResourcesFromMoviePage(resolved.url);
+          const enriched = [];
+          for (const item of resources) {
+            let info = {};
+            let infoError = null;
+            try {
+              info = await c.getResourceUnlockInfo(item);
+            } catch (e) {
+              infoError = e.message.slice(0, 100);
+            }
+            const points = info.default_unlock_points ?? info.unlock_points ?? item.unlock_points ?? null;
+            const size = info.share_size ?? item.share_size ?? 0;
+            const link = item.media_url || item.link || '';
+            const code = item.access_code || item.code || '';
+            const isUnlocked = Boolean(item.is_unlocked || item.isUnlocked || link);
+            const row = {
+              id: item.slug,
+              slug: item.slug,
+              title: (item.title || item.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || item.text?.split('\n')[0] || '未命名资源').slice(0, 100),
+              size,
+              sizeFormatted: formatSize(size),
+              points,
+              isFree: points === 0,
+              link,
+              code,
+              isUnlocked,
+              cloudType: 'cloud189',
+              uploader: item.uploader || info.uploader || '',
+              source: info.source || item.source || 'bridge',
+              movieId: tmdbId,
+              movieType: type
+            };
+            if (infoError && points === null) row.error = infoError;
+            enriched.push(row);
+          }
+          return {
+            resources: enriched,
+            movieSlug: resolved.slug,
+            movieUrl: resolved.url,
+            tmdbId,
+            type,
+            cache: { hit: false, ttlMs: config.readCacheTtlMs },
+            engine: 'browser'
+          };
         }
-
-        const points = info.default_unlock_points ?? info.unlock_points ?? r.unlock_points ?? null;
-        const size = info.share_size ?? r.share_size ?? 0;
-        // 搜索阶段只返回列表，不打开详情页抓 189 链接（否则会把单浏览器拖死）
-        let link = r.media_url || r.link || '';
-        let code = r.access_code || r.code || '';
-        let isUnlocked = Boolean(r.is_unlocked || r.isUnlocked || link);
-
-        const item = {
-          id: r.slug,
-          slug: r.slug,
-          // 用资源描述当 title，上传者昵称放到 uploader，避免已解锁卡片显示昵称
-          title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
-          size,
-          sizeFormatted: formatSize(size),
-          points,
-          isFree: points === 0,
-          link,
-          code,
-          isUnlocked,
-          cloudType: 'cloud189',
-          uploader: r.uploader || info.uploader || '',
-          // 额外字段
-          source: info.source || r.source || 'bridge',
-          movieId: tmdbId,
-          movieType: type
-        };
-        if (infoError && points === null) item.error = infoError;
-        enriched.push(item);
-      }
-
-      const payload = {
-        resources: enriched,
-        movieSlug: resolved.slug,
-        movieUrl: resolved.url,
-        tmdbId,
-        type,
-        cache: { hit: false, ttlMs: config.readCacheTtlMs }
-      };
+      });
+      const payload = { ...result, engine };
       setReadCache(cacheKey, payload);
       return payload;
     });
@@ -990,22 +1204,30 @@ function formatSize(bytes) {
 // 通用 customer API 代理
 app.post('/hdhive/customer/:action*', async (req, res) => {
   const r = await withTimeout(`customer/${req.params.action}`, async () => {
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
     const method = req.method;
-    return await client.call(method, path, {
-      query: req.query,
-      body: req.body?.body || (method !== 'GET' ? req.body : undefined)
+    const body = req.body?.body || (method !== 'GET' ? req.body : undefined);
+    const { result } = await withEngine(`customer/${req.params.action}`, {
+      cookie,
+      pure: (c) => c.call(method, path, { query: req.query, body }),
+      browser: (c) => c.call(method, path, { query: req.query, body })
     });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
 
 app.get('/hdhive/customer/:action*', async (req, res) => {
   const r = await withTimeout(`customer/${req.params.action}`, async () => {
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const path = `/api/customer/${req.params.action}${req.params[0] || ''}`;
-    return await client.call('GET', path, { query: req.query });
+    const { result } = await withEngine(`customer/${req.params.action}`, {
+      cookie,
+      pure: (c) => c.call('GET', path, { query: req.query }),
+      browser: (c) => c.call('GET', path, { query: req.query })
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -1014,8 +1236,13 @@ app.get('/hdhive/customer/:action*', async (req, res) => {
 
 app.get('/hdhive/public/bulletins/latest', async (req, res) => {
   const r = await withTimeout('public/bulletins/latest', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.getBulletins();
+    const cookie = await getRequestCookieAsync(req).catch(() => config.defaultCookie);
+    const { result } = await withEngine('public/bulletins/latest', {
+      cookie,
+      pure: (c) => c.getBulletins(),
+      browser: (c) => c.getBulletins()
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -1336,9 +1563,50 @@ app.post('/admin/cookies/:key', async (req, res) => {
 app.post('/hdhive/unlock/tmdb/:tmdbId', async (req, res) => {
   const r = await withTimeout('unlock/tmdb', async () => {
     clearReadCache();
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const type = req.body?.type || req.query.type || 'movie';
-    return await client.unlockByTmdbId(Number(req.params.tmdbId), type);
+    const tmdbId = Number(req.params.tmdbId);
+    const { result } = await withEngine('unlock/tmdb', {
+      cookie,
+      pure: async (c) => {
+        const list = await c.mediaResourcesByTmdb(tmdbId, type);
+        if (!list.resources?.length) {
+          return {
+            success: false,
+            error: 'no 189 resources found for this movie',
+            tmdbId,
+            type,
+            resolved: { slug: list.movieSlug, url: list.movieUrl }
+          };
+        }
+        const target = [...list.resources].sort((a, b) => {
+          const ap = Number.isFinite(a.points) ? a.points : 999;
+          const bp = Number.isFinite(b.points) ? b.points : 999;
+          return ap - bp;
+        })[0];
+        const unlocked = await c.unlockByResourceSlug(target.slug);
+        return {
+          success: Boolean(unlocked.link || unlocked.accessCode),
+          tmdbId,
+          type,
+          movieSlug: list.movieSlug,
+          resourceSlug: target.slug,
+          unlock: unlocked.raw,
+          cloud189: {
+            url: unlocked.link || null,
+            accessCode: unlocked.accessCode || null,
+            fullText: unlocked.fullUrl || null,
+            source: 'pure-api'
+          },
+          engine: 'pure'
+        };
+      },
+      browser: async (c) => {
+        const out = await c.unlockByTmdbId(tmdbId, type);
+        return { ...out, engine: 'browser' };
+      }
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -1354,59 +1622,79 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
     const cached = getReadCache(cacheKey);
     if (cached) return { ...cached, cache: { hit: true, ttlMs: config.readCacheTtlMs } };
 
-    // in-flight 去重：同一 cacheKey 并发只跑一次，共享结果
     return dedupe(cacheKey, async () => {
-      const client = getClient(cookie);
-
-      // 解析 TMDB → 影巢内部 URL
-      const resolved = await client.resolveTmdbToInternal(tmdbId, type);
-
-      // 找资源列表
-      const resources = await client.findResourcesFromMoviePage(resolved.url);
-
-      // 对每个资源查需要的积分（优先 DOM，checkResource 兜底；不消耗）
-      const enriched = [];
-      for (const r of resources) {
-        try {
-          const info = await client.getResourceUnlockInfo(r);
-          enriched.push({
-            slug: r.slug,
-            url: r.url,
-            title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
-            unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
-            website: info.website,
-            share_size: info.share_size ?? r.share_size ?? 0,
-            is_free: info.is_free ?? r.is_free ?? false,
-            source: info.source
-          });
-        } catch (e) {
-          enriched.push({
-            slug: r.slug,
-            url: r.url,
-            title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
-            unlock_points: null,
-            error: e.message.slice(0, 100)
-          });
+      const { result, engine } = await withEngine('preview/tmdb', {
+        cookie,
+        pure: async (c) => {
+          const preview = await c.previewTmdb(tmdbId, type);
+          return {
+            tmdbId,
+            type: preview.type || type,
+            movieSlug: preview.movieSlug,
+            movieUrl: preview.movieUrl,
+            currentPoints: preview.currentPoints,
+            resources: (preview.resources || []).map((item) => ({
+              slug: item.slug,
+              url: item.pageUrl || `${config.baseUrl}/resource/189/${item.slug}`,
+              title: item.title,
+              unlock_points: item.points,
+              website: '189',
+              share_size: item.size,
+              is_free: item.isFree,
+              source: item.source || 'html-groupData',
+              uploader: item.uploader
+            })),
+            totalCost: preview.totalCost,
+            cache: { hit: false, ttlMs: config.readCacheTtlMs },
+            engine: 'pure'
+          };
+        },
+        browser: async (c) => {
+          const resolved = await c.resolveTmdbToInternal(tmdbId, type);
+          const resources = await c.findResourcesFromMoviePage(resolved.url);
+          const enriched = [];
+          for (const item of resources) {
+            try {
+              const info = await c.getResourceUnlockInfo(item);
+              enriched.push({
+                slug: item.slug,
+                url: item.url,
+                title: (item.title || item.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || item.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+                unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
+                website: info.website,
+                share_size: info.share_size ?? item.share_size ?? 0,
+                is_free: info.is_free ?? item.is_free ?? false,
+                source: info.source
+              });
+            } catch (e) {
+              enriched.push({
+                slug: item.slug,
+                url: item.url,
+                title: (item.title || item.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || item.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+                unlock_points: null,
+                error: e.message.slice(0, 100)
+              });
+            }
+          }
+          let currentPoints = null;
+          try {
+            const user = await c.getCurrentUser();
+            currentPoints = user.data?.data?.user_meta?.points;
+          } catch {}
+          return {
+            tmdbId,
+            type,
+            movieSlug: resolved.slug,
+            movieUrl: resolved.url,
+            currentPoints,
+            resources: enriched,
+            totalCost: enriched.reduce((sum, row) => sum + (row.unlock_points || 0), 0),
+            cache: { hit: false, ttlMs: config.readCacheTtlMs },
+            engine: 'browser'
+          };
         }
-      }
-
-      // 当前用户积分
-      let currentPoints = null;
-      try {
-        const user = await client.getCurrentUser();
-        currentPoints = user.data?.data?.user_meta?.points;
-      } catch {}
-
-      const payload = {
-        tmdbId,
-        type,
-        movieSlug: resolved.slug,
-        movieUrl: resolved.url,
-        currentPoints,
-        resources: enriched,
-        totalCost: enriched.reduce((sum, r) => sum + (r.unlock_points || 0), 0),
-        cache: { hit: false, ttlMs: config.readCacheTtlMs }
-      };
+      });
+      const payload = { ...result, engine };
       setReadCache(cacheKey, payload);
       return payload;
     });
@@ -1418,48 +1706,87 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
 app.post('/hdhive/unlock/resource/:slug', async (req, res) => {
   const r = await withTimeout('unlock/resource', async () => {
     clearReadCache();
-    const client = getClient(await getRequestCookieAsync(req));
-    return await client.unlockByResourceSlug(req.params.slug);
+    const cookie = await getRequestCookieAsync(req);
+    const { result } = await withEngine('unlock/resource', {
+      cookie,
+      pure: async (c) => {
+        const unlocked = await c.unlockByResourceSlug(req.params.slug);
+        return {
+          success: Boolean(unlocked.link || unlocked.accessCode),
+          slug: unlocked.slug,
+          detail: null,
+          unlock: unlocked.raw,
+          cloud189: {
+            url: unlocked.link || null,
+            accessCode: unlocked.accessCode || null,
+            fullText: unlocked.fullUrl || null,
+            source: 'pure-api'
+          },
+          engine: 'pure'
+        };
+      },
+      browser: async (c) => {
+        const out = await c.unlockByResourceSlug(req.params.slug);
+        return { ...out, engine: 'browser' };
+      }
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
 
-// Movie URL 一键解锁
+// Movie URL 一键解锁（createResource 仍依赖浏览器/旧逻辑）
 app.post('/hdhive/unlock/share', async (req, res) => {
   const r = await withTimeout('unlock/share', async () => {
     clearReadCache();
     const client = getClient(await getRequestCookieAsync(req));
     const { url, movieId } = req.body || {};
     if (!url) throw new Error('url is required');
-    return await client.unlockByShareUrl(url, movieId);
+    const out = await client.unlockByShareUrl(url, movieId);
+    state.lastEngine = 'browser';
+    return { ...out, engine: 'browser' };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
 
 // 单独提取 189 网盘链接（resource slug）
-// 页面抓取失败时，回退到 unlock 合并路径（已解锁不扣费）
+// pure：unlock API；浏览器：页面抓取 + unlock 回退
 app.get('/hdhive/resource/:slug/cloud189', async (req, res) => {
   const r = await withTimeout('resource/cloud189', async () => {
-    const client = getClient(await getRequestCookieAsync(req));
+    const cookie = await getRequestCookieAsync(req);
     const slug = req.params.slug;
-    let links = null;
-    try {
-      links = await client.getCloud189Links(slug);
-    } catch (e) {
-      links = { error: e.message };
-    }
-    if (links?.url && links?.accessCode) return links;
-
-    // 回退：走 unlock API（already_owned 不扣积分）再合并 access_code
-    try {
-      const unlock = await client.unlockResource(slug);
-      const merged = client._mergeCloud189FromUnlock(unlock, links || {});
-      if (merged?.url || merged?.accessCode) return merged;
-    } catch (e) {
-      if (links && !links.error) links.error = e.message;
-      else links = { error: e.message };
-    }
-    return links || { url: null, accessCode: null, fullText: null, error: 'no cloud189 link' };
+    const { result } = await withEngine('resource/cloud189', {
+      cookie,
+      pure: async (c) => {
+        const unlocked = await c.unlockByResourceSlug(slug);
+        return {
+          url: unlocked.link || null,
+          accessCode: unlocked.accessCode || null,
+          fullText: unlocked.fullUrl || null,
+          source: 'pure-api',
+          already_owned: unlocked.raw?.data?.already_owned
+        };
+      },
+      browser: async (c) => {
+        let links = null;
+        try {
+          links = await c.getCloud189Links(slug);
+        } catch (e) {
+          links = { error: e.message };
+        }
+        if (links?.url && links?.accessCode) return links;
+        try {
+          const unlock = await c.unlockResource(slug);
+          const merged = c._mergeCloud189FromUnlock(unlock, links || {});
+          if (merged?.url || merged?.accessCode) return merged;
+        } catch (e) {
+          if (links && !links.error) links.error = e.message;
+          else links = { error: e.message };
+        }
+        return links || { url: null, accessCode: null, fullText: null, error: 'no cloud189 link' };
+      }
+    });
+    return result;
   });
   res.status(r.success ? 200 : 500).json(r);
 });
@@ -1511,17 +1838,36 @@ app.listen(config.port, '0.0.0.0', async () => {
     }
   }
 
-  if (config.autoWarmup && hasCompleteLoginCookie(config.defaultCookie)) {
-    console.log('[hdhive-api] auto warmup...');
+  console.log(`[hdhive-api] hybridMode=${config.hybridMode} autoWarmupBrowser=${config.autoWarmupBrowser}`);
+
+  // pure 预热：握手一次即可 ready，不启动浏览器
+  if (config.autoWarmup && preferPure() && hasCompleteLoginCookie(config.defaultCookie)) {
+    console.log('[hdhive-api] pure warmup (handshake)...');
+    try {
+      await ensurePureReady(config.defaultCookie);
+      state.warmupAt = Date.now();
+      console.log('[hdhive-api] pure warmup OK');
+    } catch (e) {
+      console.error('[hdhive-api] pure warmup failed:', e.message);
+    }
+  }
+
+  // 浏览器预热：仅 hybridMode=browser 或显式 AUTO_WARMUP_BROWSER=true
+  const shouldWarmBrowser = config.autoWarmup && hasCompleteLoginCookie(config.defaultCookie)
+    && (forceBrowserOnly() || config.autoWarmupBrowser);
+  if (shouldWarmBrowser) {
+    console.log('[hdhive-api] browser warmup...');
     try {
       const client = getClient();
       await client._ensureBrowser();
       state.warmupAt = Date.now();
       state.warmupOk = true;
-      console.log('[hdhive-api] warmup OK');
+      console.log('[hdhive-api] browser warmup OK');
     } catch (e) {
-      console.error('[hdhive-api] warmup failed:', e.message);
+      console.error('[hdhive-api] browser warmup failed:', e.message);
     }
+  } else if (preferPure()) {
+    console.log('[hdhive-api] skip browser warmup (hybrid pure-first)');
   }
 });
 
@@ -1529,6 +1875,7 @@ app.listen(config.port, '0.0.0.0', async () => {
 async function shutdown() {
   console.log('[hdhive-api] shutting down...');
   if (state.client) await state.client.close().catch(() => {});
+  state.pureClient = null;
   if (dbState.pool) await dbState.pool.end().catch(() => {});
   process.exit(0);
 }
