@@ -228,14 +228,18 @@ function buildLaunchOptions({ headless = true, userAgent, proxy } = {}) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
-      '--headless=new',
+      // headless=old 更稳；new + swiftshader 在这台低内存机器上会 Compositor trap int3 崩
+      '--headless=old',
       '--disable-gpu',
-      '--use-gl=angle',
-      '--use-angle=swiftshader-webgl',
+      '--disable-gpu-compositing',
+      '--use-gl=disabled',
+      '--disable-software-rasterizer',
       '--disable-webgl',
       '--disable-webgl2',
       '--max-active-webgl-contexts=0',
       '--disable-features=Vulkan,UseSkiaRenderer,DefaultANGLE,PaintHolding,WebGL,WebGL2',
+      '--js-flags=--max-old-space-size=256',
+      '--renderer-process-limit=1',
       '--window-size=1366,768',
       '--lang=zh-CN'
     ]
@@ -756,6 +760,8 @@ export class HdhiveClient {
     if (this._page && this._page.isClosed()) {
       this._ready = false;
       this._page = null;
+      try { await this._context?.close(); } catch {}
+      this._context = null;
     }
     // 已就绪且 page 健康，直接返回
     if (this._ready && this._page) return;
@@ -764,6 +770,14 @@ export class HdhiveClient {
     if (this._ensuring) return this._ensuring;
 
     this._ensuring = (async () => {
+      // 确保旧 context 清干净
+      if (this._context) {
+        try { await this._context.close(); } catch {}
+        this._context = null;
+        this._page = null;
+        this._ready = false;
+      }
+
       const profileDir = path.join(os.tmpdir(), `hdhive-api-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       fs.mkdirSync(profileDir, { recursive: true });
       const launchOptions = buildLaunchOptions({
@@ -774,6 +788,11 @@ export class HdhiveClient {
       // storageState 只能给 browser.newContext，不能给 launchPersistentContext；
       // 持久化 profile 场景下用 addCookies + 页面内 bind 恢复。
       this._context = await chromium.launchPersistentContext(profileDir, launchOptions);
+      this._context.on('close', () => {
+        this._ready = false;
+        this._page = null;
+        this._context = null;
+      });
       await this._context.addInitScript(STEALTH_SCRIPT);
       await this._context.addInitScript(RSC_INTERCEPTOR_SCRIPT);
       await this._context.addInitScript(DISABLE_ANIMATION_SCRIPT);
@@ -800,8 +819,15 @@ export class HdhiveClient {
       }
 
       this._page = await this._context.pages()[0] || await this._context.newPage();
+      this._page.on('crash', () => {
+        this._ready = false;
+        this._page = null;
+      });
       const targetUrl = initialUrl || this.baseUrl;
       await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      // 等导航稳定后再 evaluate，避免 context destroyed
+      await this._page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
+      await this._page.waitForTimeout(500).catch(() => undefined);
       await this._page.waitForFunction(
         () => document.readyState !== 'loading',
         { timeout: 5000 }
@@ -840,20 +866,44 @@ export class HdhiveClient {
   }
 
   async _ensureHdhiveRuntime() {
+    // page/context 崩过就强制重建
+    if (!this._page || this._page.isClosed() || !this._context) {
+      this._ready = false;
+    }
     await this._ensureBrowser({ initialUrl: this.baseUrl });
     this._clearIdleTimer();
-    if (!this._page.url().startsWith(this.baseUrl)) {
+    if (!this._page || this._page.isClosed()) {
+      this._ready = false;
+      await this._ensureBrowser({ initialUrl: this.baseUrl });
+    }
+    const onSite = (() => {
+      try { return this._page.url().startsWith(this.baseUrl); } catch { return false; }
+    })();
+    if (!onSite) {
       await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await this._page.waitForTimeout(300).catch(() => undefined);
       if (this.bindSecret) {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
     }
-    const ready = await this._page.waitForFunction(
-      () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
-      { timeout: 5000 }
-    ).then(() => true).catch(() => false);
+    let ready = false;
+    try {
+      ready = await this._page.waitForFunction(
+        () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
+        { timeout: 5000 }
+      ).then(() => true).catch(() => false);
+    } catch {
+      ready = false;
+    }
     if (!ready) {
-      await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      // 可能 crash / navigation 中，重建一次
+      if (!this._page || this._page.isClosed()) {
+        this._ready = false;
+        await this._ensureBrowser({ initialUrl: this.baseUrl });
+      } else {
+        await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await this._page.waitForTimeout(300).catch(() => undefined);
+      }
       if (this.bindSecret) {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
@@ -944,8 +994,13 @@ export class HdhiveClient {
         message = result.error?.message || String(result.error || 'signed fetch failed');
       }
 
-      if (/WASM|wasm|SignedFetchError|加载失败/i.test(message || '')) {
-        await this._reloadPage();
+      if (/WASM|wasm|SignedFetchError|加载失败|Target crashed|Execution context was destroyed|Target closed|Session closed/i.test(message || '')) {
+        // 浏览器崩了：整实例重建再试一次
+        this._ready = false;
+        try { await this._context?.close(); } catch {}
+        this._context = null;
+        this._page = null;
+        await this._ensureHdhiveRuntime();
         if (this.bindSecret) {
           await this._seedBindSecret(this.bindSecret).catch(() => false);
         }
@@ -2391,68 +2446,145 @@ export class HdhiveClient {
   }
 
   /**
+   * 从 unlock API / 页面文本中尽量抠访问码
+   */
+  _pickAccessCode(...sources) {
+    for (const source of sources) {
+      if (source == null) continue;
+      const text = String(source).trim();
+      if (!text) continue;
+      if (/^[A-Za-z0-9]{4,8}$/.test(text)) return text;
+      const m = text.match(/(?:访问码|提取码)[：:\s（(]*([A-Za-z0-9]{4,8})/i)
+        || text.match(/access[_-]?code["'\s:=]+([A-Za-z0-9]{4,8})/i)
+        || text.match(/[（(]\s*访问码[：:\s]*([A-Za-z0-9]{4,8})\s*[）)]/i);
+      if (m?.[1]) return m[1];
+    }
+    return null;
+  }
+
+  _normalizeCloud189(url, accessCode, extra = {}) {
+    const cleanUrl = url || null;
+    const code = accessCode || null;
+    return {
+      url: cleanUrl,
+      accessCode: code,
+      shareSize: extra.shareSize || null,
+      remark: extra.remark || null,
+      fullText: cleanUrl
+        ? (code ? `${cleanUrl}（访问码：${code}）` : cleanUrl)
+        : null,
+      missingAccessCode: Boolean(cleanUrl && !code),
+      source: extra.source || null,
+      error: extra.error || null
+    };
+  }
+
+  /**
+   * 把 unlock API 返回的 access_code / full_url 合并进 cloud189 结果。
+   * 页面抓取经常丢访问码，但 unlock 接口本身常有。
+   */
+  _mergeCloud189FromUnlock(unlockResponse, links = {}) {
+    const root = unlockResponse?.data ?? unlockResponse ?? {};
+    const api = root?.data && typeof root.data === 'object' ? root.data : root;
+    const url = links?.url || api?.url || null;
+    const accessCode = this._pickAccessCode(
+      links?.accessCode,
+      api?.access_code,
+      api?.accessCode,
+      api?.code,
+      api?.full_url,
+      api?.fullUrl,
+      links?.fullText
+    );
+    const source = links?.accessCode
+      ? (links.source || 'page-content')
+      : (this._pickAccessCode(api?.access_code, api?.accessCode, api?.full_url) ? 'unlock-api' : (links?.source || null));
+    return this._normalizeCloud189(url, accessCode, {
+      shareSize: links?.shareSize || api?.share_size || null,
+      remark: links?.remark || api?.remark || null,
+      source,
+      error: (!url && !accessCode) ? (links?.error || 'no cloud189 link') : null
+    });
+  }
+
+  /**
    * 通过拦截 Next.js RSC payload 直接拿 cloud189 URL（**优化版，比 DOM 爬取快 5 倍**）
    * @param {string} slugOrUrl
    */
   async getCloud189Links(slugOrUrl) {
-    let slug = slugOrUrl;
-    const m = String(slugOrUrl).match(/\/resource\/189\/([a-f0-9]{32})/);
-    if (m) slug = m[1];
-    if (!/^[a-f0-9]{32}$/.test(slug)) {
-      throw new Error(`Invalid resource slug: ${slug}`);
-    }
-
-    await this._ensureBrowser();
-    const detailUrl = `${this.baseUrl}/resource/189/${slug}`;
-
-    // 复用页面：如果已经在该 URL 就跳过 navigate
-    if (this._page.url() !== detailUrl) {
-      try { await this._page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
-    }
-
-    // 优先尝试：1) 直接读 page.content()（快）
-    let html = await this._page.content().catch(() => '');
-    let urlMatch = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)];
-    let codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
-
-    // 如果 page.content() 没拿到，轮询等待 RSC 流式 push 写入（最多 3 秒，命中即早退）
-    if (urlMatch.length === 0 && !codeMatch) {
-      const deadline = Date.now() + 3000;
-      while (urlMatch.length === 0 && !codeMatch && Date.now() < deadline) {
-        await this._page.waitForTimeout(200);
-        html = await this._page.content().catch(() => '');
-        urlMatch = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)];
-        codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
+    return this._withBusy(async () => {
+      let slug = slugOrUrl;
+      const m = String(slugOrUrl).match(/\/resource\/189\/([a-f0-9]{32})/);
+      if (m) slug = m[1];
+      if (!/^[a-f0-9]{32}$/.test(slug)) {
+        throw new Error(`Invalid resource slug: ${slug}`);
       }
-    }
 
-    // 提取访问码（从各种可能位置）
-    if (!codeMatch) {
-      const codeMatch2 = html.match(/access[_-]?code["\s:]+([a-zA-Z0-9]{4,8})/i);
-      if (codeMatch2) codeMatch = codeMatch2;
-    }
+      await this._ensureBrowser();
+      const detailUrl = `${this.baseUrl}/resource/189/${slug}`;
 
-    // 提取备注/大小
-    const remarkMatch = html.match(/["']remark["']\s*:\s*["']([^"']{10,200})/);
-    const sizeMatch = html.match(/["']share_size["']\s*:\s*["']([^"']+)/);
+      // 必须停住 idle park，否则 goto 会被 about:blank 冲掉
+      this._clearIdleTimer();
+      try {
+        if (!this._page.url().startsWith(detailUrl)) {
+          await this._page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this._page.waitForTimeout(400).catch(() => undefined);
+        }
+      } catch {}
 
-    if (urlMatch.length === 0 && !codeMatch) {
-      return { url: null, accessCode: null, fullText: null, error: 'no cloud189 link found in page' };
-    }
+      const extractFromHtml = (html, text = '') => {
+        const blob = `${html || ''}\n${text || ''}`;
+        const urlMatch = [...blob.matchAll(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn)\/t\/[a-zA-Z0-9]+/g)];
+        const code = this._pickAccessCode(
+          blob.match(/(?:访问码|提取码)[：:\s（(]*([A-Za-z0-9]{4,8})/i)?.[0],
+          blob.match(/access[_-]?code["'\s:=]+([A-Za-z0-9]{4,8})/i)?.[1],
+          blob.match(/[（(]\s*访问码[：:\s]*([A-Za-z0-9]{4,8})\s*[）)]/i)?.[1]
+        );
+        const remarkMatch = blob.match(/["']remark["']\s*:\s*["']([^"']{5,200})/);
+        const sizeMatch = blob.match(/["']share_size["']\s*:\s*["']?([^"'}\s,]+)/);
+        return {
+          url: urlMatch[0]?.[0] || null,
+          accessCode: code,
+          remark: remarkMatch?.[1] || null,
+          shareSize: sizeMatch?.[1] || null
+        };
+      };
 
-    const cloud189Url = urlMatch[0]?.[0] || null;
-    const accessCode = codeMatch?.[1] || null;
+      let html = await this._page.content().catch(() => '');
+      let text = await this._page.evaluate(() => document.body?.innerText || '').catch(() => '');
+      let parsed = extractFromHtml(html, text);
 
-    return {
-      url: cloud189Url,
-      accessCode,
-      shareSize: sizeMatch?.[1] || null,
-      remark: remarkMatch?.[1] || null,
-      fullText: accessCode
-        ? `${cloud189Url}（访问码：${accessCode}）`
-        : cloud189Url,
-      source: 'page-content'
-    };
+      if (!parsed.url && !parsed.accessCode) {
+        const deadline = Date.now() + 4000;
+        while (!parsed.url && !parsed.accessCode && Date.now() < deadline) {
+          await this._page.waitForTimeout(250);
+          html = await this._page.content().catch(() => '');
+          text = await this._page.evaluate(() => document.body?.innerText || '').catch(() => '');
+          parsed = extractFromHtml(html, text);
+        }
+      }
+
+      if (!parsed.url && !parsed.accessCode) {
+        const dom = await this._getCloud189FromDOM(slug);
+        if (dom?.url || dom?.accessCode) {
+          return this._normalizeCloud189(dom.url, dom.accessCode, {
+            source: 'dom-fallback',
+            remark: dom.remark || null,
+            shareSize: dom.shareSize || null
+          });
+        }
+        return this._normalizeCloud189(null, null, {
+          source: 'page-content',
+          error: 'no cloud189 link found in page'
+        });
+      }
+
+      return this._normalizeCloud189(parsed.url, parsed.accessCode, {
+        shareSize: parsed.shareSize,
+        remark: parsed.remark,
+        source: 'page-content'
+      });
+    });
   }
 
   /**
@@ -2460,12 +2592,14 @@ export class HdhiveClient {
    */
   async _getCloud189FromDOM(slug) {
     const html = await this._page.content().catch(() => '');
-    const links = [...html.matchAll(/https?:\/\/cloud\.189\.cn\/t\/[a-zA-Z0-9]+/g)].map(m => m[0]);
-    const codeMatch = html.match(/访问码[：:]*\s*([a-zA-Z0-9]{4,8})/i);
+    const text = await this._page.evaluate(() => document.body?.innerText || '').catch(() => '');
+    const blob = `${html}\n${text}`;
+    const links = [...blob.matchAll(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn)\/t\/[a-zA-Z0-9]+/g)].map(m => m[0]);
+    const accessCode = this._pickAccessCode(blob);
     return {
       url: links[0] || null,
-      accessCode: codeMatch?.[1] || null,
-      fullText: links[0] ? `${links[0]}${codeMatch ? `（访问码：${codeMatch[1]}）` : ''}` : null,
+      accessCode,
+      fullText: links[0] ? (accessCode ? `${links[0]}（访问码：${accessCode}）` : links[0]) : null,
       source: 'dom-fallback'
     };
   }
@@ -2475,78 +2609,111 @@ export class HdhiveClient {
    * 步骤：resolve → findRes → unlock → getCloud189
    */
   async unlockByTmdbId(tmdbId, type = 'movie') {
-    console.log(`[1/4] 解析 TMDB ${type}/${tmdbId} (无需登录)`);
-    const resolved = await this.resolveTmdbToInternal(tmdbId, type);
-    console.log(`  → ${resolved.url}`);
+    return this._withBusy(async () => {
+      console.log(`[1/4] 解析 TMDB ${type}/${tmdbId} (无需登录)`);
+      const resolved = await this.resolveTmdbToInternal(tmdbId, type);
+      console.log(`  → ${resolved.url}`);
 
-    console.log(`[2/4] 找 189 资源列表`);
-    const resources = await this.findResourcesFromMoviePage(resolved.url);
-    console.log(`  → 找到 ${resources.length} 个资源`);
-    if (resources.length === 0) {
+      console.log(`[2/4] 找 189 资源列表`);
+      const resources = await this.findResourcesFromMoviePage(resolved.url);
+      console.log(`  → 找到 ${resources.length} 个资源`);
+      if (resources.length === 0) {
+        return {
+          success: false,
+          error: 'no 189 resources found for this movie',
+          tmdbId,
+          type,
+          resolved
+        };
+      }
+
+      // 优先免费/低积分资源
+      const target = [...resources].sort((a, b) => {
+        const ap = Number.isFinite(a.unlock_points) ? a.unlock_points : 999;
+        const bp = Number.isFinite(b.unlock_points) ? b.unlock_points : 999;
+        return ap - bp;
+      })[0];
+      console.log(`[3/4] 解锁资源 ${target.slug}`);
+      const unlock = await this.unlockResource(target.slug);
+      console.log(`  → ${unlock.data?.message || unlock.data?.description || unlock.status}`);
+
+      console.log(`[4/4] 提取 189 链接/访问码（优先合并 unlock API）`);
+      let links = {};
+      try {
+        links = await this.getCloud189Links(target.slug);
+      } catch (e) {
+        links = { error: e.message };
+      }
+      const cloud189 = this._mergeCloud189FromUnlock(unlock, links);
+      console.log(`  → ${cloud189.fullText || cloud189.error}`);
+
       return {
-        success: false,
-        error: 'no 189 resources found for this movie',
+        success: Boolean(cloud189.url || this._pickAccessCode(unlock?.data?.data?.access_code, unlock?.data?.access_code)),
         tmdbId,
         type,
-        resolved
+        movieSlug: resolved.slug,
+        resourceSlug: target.slug,
+        unlock: unlock.data,
+        cloud189
       };
-    }
-
-    const target = resources[0];
-    console.log(`[3/4] 解锁资源 ${target.slug}`);
-    const unlock = await this.unlockResource(target.slug);
-    console.log(`  → ${unlock.data?.message}`);
-
-    console.log(`[4/4] 通过 RSC payload 提取 189 链接`);
-    const links = await this.getCloud189Links(target.slug);
-    console.log(`  → ${links.fullText}`);
-
-    return {
-      success: true,
-      tmdbId,
-      type,
-      movieSlug: resolved.slug,
-      resourceSlug: target.slug,
-      unlock: unlock.data,
-      cloud189: links
-    };
+    });
   }
 
   async unlockByResourceSlug(slugOrUrl) {
-    let slug = slugOrUrl;
-    const m = String(slugOrUrl).match(/\/resource\/189\/([a-f0-9]{32})/);
-    if (m) slug = m[1];
-    if (!/^[a-f0-9]{32}$/.test(slug)) throw new Error(`Invalid slug: ${slug}`);
+    return this._withBusy(async () => {
+      let slug = slugOrUrl;
+      const m = String(slugOrUrl).match(/\/resource\/189\/([a-f0-9]{32})/);
+      if (m) slug = m[1];
+      if (!/^[a-f0-9]{32}$/.test(slug)) throw new Error(`Invalid slug: ${slug}`);
 
-    const detail = await this.getResource(slug);
-    if (!detail.data?.success) return { success: false, error: detail.data?.description };
+      const detail = await this.getResource(slug).catch(e => ({ error: e.message }));
+      const unlock = await this.unlockResource(slug);
+      let links = {};
+      try {
+        links = await this.getCloud189Links(slug);
+      } catch (e) {
+        links = { error: e.message };
+      }
+      const cloud189 = this._mergeCloud189FromUnlock(unlock, links);
 
-    const unlock = await this.unlockResource(slug);
-    const links = await this.getCloud189Links(slug);
-
-    return {
-      success: true,
-      slug,
-      detail: detail.data,
-      unlock: unlock.data,
-      cloud189: links
-    };
+      return {
+        success: Boolean(cloud189.url || cloud189.accessCode),
+        slug,
+        detail: detail?.data || detail || null,
+        unlock: unlock.data,
+        cloud189
+      };
+    });
   }
 
   async unlockByShareUrl(shareUrl, movieId = 1) {
-    const create = await this.createResource(shareUrl, movieId);
-    const isSuccess = create.data?.success || (create.data?.description || '').includes('已存在');
-    if (!isSuccess) return { success: false, error: 'create failed', detail: create };
-    let slug = create.data?.data?.slug;
-    if (!slug) {
-      const m = shareUrl.match(/\/(movie|tv)\/([a-f0-9]{32})/);
-      if (m) slug = m[2];
-      else return { success: false, error: 'no slug found' };
-    }
-    const detail = await this.getResource(slug);
-    const unlock = await this.unlockResource(slug);
-    const links = await this.getCloud189Links(slug);
-    return { success: true, slug, detail: detail.data, unlock: unlock.data, cloud189: links };
+    return this._withBusy(async () => {
+      const create = await this.createResource(shareUrl, movieId);
+      const isSuccess = create.data?.success || (create.data?.description || '').includes('已存在');
+      if (!isSuccess) return { success: false, error: 'create failed', detail: create };
+      let slug = create.data?.data?.slug;
+      if (!slug) {
+        const m = shareUrl.match(/\/(movie|tv)\/([a-f0-9]{32})/);
+        if (m) slug = m[2];
+        else return { success: false, error: 'no slug found' };
+      }
+      const detail = await this.getResource(slug).catch(e => ({ error: e.message }));
+      const unlock = await this.unlockResource(slug);
+      let links = {};
+      try {
+        links = await this.getCloud189Links(slug);
+      } catch (e) {
+        links = { error: e.message };
+      }
+      const cloud189 = this._mergeCloud189FromUnlock(unlock, links);
+      return {
+        success: Boolean(cloud189.url || cloud189.accessCode),
+        slug,
+        detail: detail?.data || detail || null,
+        unlock: unlock.data,
+        cloud189
+      };
+    });
   }
 
   get(path, query) { return this.call('GET', path, { query }); }

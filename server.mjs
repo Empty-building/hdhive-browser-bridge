@@ -802,11 +802,11 @@ app.post('/hdhive/customer/resources/:resourceId/unlock', async (req, res) => {
 
     // 3. 解析 access_code（解锁返回的 url 字段包含）
     const apiData = unlock.data?.data || {};
-    const accessCode = apiData.access_code || cloud189?.accessCode || '';
     const shareUrl = apiData.url || cloud189?.url || '';
-    const fullUrl = apiData.full_url || (shareUrl && accessCode
-      ? `${shareUrl}（访问码：${accessCode}）`
-      : shareUrl);
+    // 优先用 unlock API 的 access_code，页面抓取经常丢码
+    const accessCode = apiData.access_code || apiData.accessCode || cloud189?.accessCode || '';
+    const fullUrl = apiData.full_url
+      || (shareUrl && accessCode ? `${shareUrl}（访问码：${accessCode}）` : shareUrl);
 
     return {
       // cloud189-auto-save 期望的字段
@@ -907,7 +907,7 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
             const cloud189 = await client.getCloud189Links(r.slug);
             if (cloud189.url) {
               link = cloud189.url;
-              code = cloud189.accessCode || '';
+              code = cloud189.accessCode || code || '';
               isUnlocked = true;
             }
           } catch {}
@@ -1248,8 +1248,15 @@ app.post('/browser/restart', async (req, res) => {
       state.warmupOk = false;
     }
     clearReadCache();
-    // 下次调用会重建
-    return { restarted: true };
+    // 立刻重建并预热，避免 health 一直 warming_up
+    const cookie = await getRequestCookieAsync(req).catch(() => config.defaultCookie);
+    if (cookie) {
+      const client = getClient(cookie);
+      await client._ensureBrowser();
+      state.warmupAt = Date.now();
+      state.warmupOk = true;
+    }
+    return { restarted: true, warmupOk: state.warmupOk };
   });
   res.status(r.success ? 200 : 500).json(r);
 });
