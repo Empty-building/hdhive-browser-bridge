@@ -8,7 +8,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import pg from 'pg';
-import { HdhiveClient, STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT } from './api-client.mjs';
+import { HdhiveClient, STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT, DISABLE_ANIMATION_SCRIPT } from './api-client.mjs';
 
 const config = {
   port: Number(process.env.PORT || 10000),
@@ -1045,6 +1045,7 @@ async function performHdhiveLogin({
   try {
     await ctx.addInitScript(STEALTH_SCRIPT);
     await ctx.addInitScript(RSC_INTERCEPTOR_SCRIPT);
+    await ctx.addInitScript(DISABLE_ANIMATION_SCRIPT);
 
     const page = await ctx.pages()[0] || await ctx.newPage();
     await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });

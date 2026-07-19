@@ -307,8 +307,76 @@ const RSC_INTERCEPTOR_SCRIPT = `
 })();
 `;
 
+/**
+ * 禁用页面动画/渲染空转（无真 GPU 时 SwiftShader 会狂吃 CPU）
+ * 不影响 API 签名模块，只停 CSS/动画帧/canvas 循环。
+ */
+const DISABLE_ANIMATION_SCRIPT = `
+(() => {
+  try {
+    const style = document.createElement('style');
+    style.setAttribute('data-hdhive-disable-anim', '1');
+    style.textContent = \`
+      *, *::before, *::after {
+        animation: none !important;
+        animation-duration: 0s !important;
+        animation-delay: 0s !important;
+        animation-iteration-count: 1 !important;
+        transition: none !important;
+        transition-duration: 0s !important;
+        transition-delay: 0s !important;
+        scroll-behavior: auto !important;
+        caret-color: transparent !important;
+      }
+      canvas, video, lottie-player, dotlottie-player {
+        display: none !important;
+      }
+    \`;
+    const mount = () => {
+      const root = document.head || document.documentElement;
+      if (root && !document.querySelector('style[data-hdhive-disable-anim]')) {
+        root.appendChild(style);
+      }
+    };
+    mount();
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  } catch {}
+
+  // 停掉 rAF / rIC 循环（首页 lottie / canvas 常用）
+  const noopRaf = (cb) => {
+    const id = Math.floor(Math.random() * 1e9);
+    // 不调度回调，直接吞掉动画帧
+    return id;
+  };
+  try { window.requestAnimationFrame = noopRaf; } catch {}
+  try { window.webkitRequestAnimationFrame = noopRaf; } catch {}
+  try { window.cancelAnimationFrame = () => {}; } catch {}
+  try {
+    if (window.requestIdleCallback) {
+      window.requestIdleCallback = (cb) => {
+        // 给一次空闲回调但不持续循环
+        return setTimeout(() => {
+          try { cb({ didTimeout: false, timeRemaining: () => 0 }); } catch {}
+        }, 0);
+      };
+      window.cancelIdleCallback = (id) => clearTimeout(id);
+    }
+  } catch {}
+
+  // 限制 setInterval 高频动画（>= 30fps 的直接降到 1s）
+  try {
+    const nativeSetInterval = window.setInterval.bind(window);
+    window.setInterval = (fn, delay, ...args) => {
+      const ms = Number(delay);
+      const safeDelay = Number.isFinite(ms) && ms > 0 && ms < 33 ? 1000 : delay;
+      return nativeSetInterval(fn, safeDelay, ...args);
+    };
+  } catch {}
+})();
+`;
+
 // 导出 stealth 脚本供 server.mjs 复用
-export { STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT };
+export { STEALTH_SCRIPT, RSC_INTERCEPTOR_SCRIPT, DISABLE_ANIMATION_SCRIPT };
 
 function readNumber(...values) {
   for (const value of values) {
@@ -665,6 +733,7 @@ export class HdhiveClient {
       this._context = await chromium.launchPersistentContext(profileDir, launchOptions);
       await this._context.addInitScript(STEALTH_SCRIPT);
       await this._context.addInitScript(RSC_INTERCEPTOR_SCRIPT);
+      await this._context.addInitScript(DISABLE_ANIMATION_SCRIPT);
 
       // 拦截图片、广告等无关资源加速加载
       await this._context.route('**/*', (route) => {
@@ -2079,6 +2148,7 @@ export class HdhiveClient {
       proxy: this.proxy
     }));
     await ctx.addInitScript(STEALTH_SCRIPT);
+    await ctx.addInitScript(DISABLE_ANIMATION_SCRIPT);
     const page = await ctx.pages()[0] || await ctx.newPage();
     // 拦截图片/统计加速
     await ctx.route('**/*', (route) => {
