@@ -309,7 +309,7 @@ const RSC_INTERCEPTOR_SCRIPT = `
 
 /**
  * 禁用页面动画/渲染空转（无真 GPU 时 SwiftShader 会狂吃 CPU）
- * 不影响 API 签名模块，只停 CSS/动画帧/canvas 循环。
+ * 不影响 API 签名模块，只停 CSS/动画帧/canvas/WebGL 循环。
  */
 const DISABLE_ANIMATION_SCRIPT = `
 (() => {
@@ -317,6 +317,7 @@ const DISABLE_ANIMATION_SCRIPT = `
     const style = document.createElement('style');
     style.setAttribute('data-hdhive-disable-anim', '1');
     style.textContent = \`
+      html { filter: none !important; }
       *, *::before, *::after {
         animation: none !important;
         animation-duration: 0s !important;
@@ -327,9 +328,13 @@ const DISABLE_ANIMATION_SCRIPT = `
         transition-delay: 0s !important;
         scroll-behavior: auto !important;
         caret-color: transparent !important;
+        backdrop-filter: none !important;
+        view-timeline: none !important;
       }
-      canvas, video, lottie-player, dotlottie-player {
+      canvas, video, lottie-player, dotlottie-player, svg animate, svg animateTransform {
         display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
       }
     \`;
     const mount = () => {
@@ -340,37 +345,73 @@ const DISABLE_ANIMATION_SCRIPT = `
     };
     mount();
     document.addEventListener('DOMContentLoaded', mount, { once: true });
+    // 页面后注入的 style 再补一次
+    setTimeout(mount, 0);
+    setTimeout(mount, 1000);
   } catch {}
 
   // 停掉 rAF / rIC 循环（首页 lottie / canvas 常用）
-  const noopRaf = (cb) => {
-    const id = Math.floor(Math.random() * 1e9);
-    // 不调度回调，直接吞掉动画帧
-    return id;
-  };
+  let rafSeq = 1;
+  const noopRaf = () => rafSeq++;
   try { window.requestAnimationFrame = noopRaf; } catch {}
   try { window.webkitRequestAnimationFrame = noopRaf; } catch {}
+  try { window.mozRequestAnimationFrame = noopRaf; } catch {}
   try { window.cancelAnimationFrame = () => {}; } catch {}
   try {
     if (window.requestIdleCallback) {
-      window.requestIdleCallback = (cb) => {
-        // 给一次空闲回调但不持续循环
-        return setTimeout(() => {
-          try { cb({ didTimeout: false, timeRemaining: () => 0 }); } catch {}
-        }, 0);
-      };
+      window.requestIdleCallback = (cb) => setTimeout(() => {
+        try { cb({ didTimeout: true, timeRemaining: () => 0 }); } catch {}
+      }, 1000);
       window.cancelIdleCallback = (id) => clearTimeout(id);
     }
   } catch {}
 
-  // 限制 setInterval 高频动画（>= 30fps 的直接降到 1s）
+  // 限制 setInterval / setTimeout 高频动画
   try {
     const nativeSetInterval = window.setInterval.bind(window);
     window.setInterval = (fn, delay, ...args) => {
       const ms = Number(delay);
-      const safeDelay = Number.isFinite(ms) && ms > 0 && ms < 33 ? 1000 : delay;
+      const safeDelay = Number.isFinite(ms) && ms > 0 && ms < 50 ? 1000 : delay;
       return nativeSetInterval(fn, safeDelay, ...args);
     };
+  } catch {}
+  try {
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, delay, ...args) => {
+      const ms = Number(delay);
+      // 0/极短 timeout 常见于动画调度，抬到 50ms 减少刷屏
+      const safeDelay = Number.isFinite(ms) && ms >= 0 && ms < 8 ? 50 : delay;
+      return nativeSetTimeout(fn, safeDelay, ...args);
+    };
+  } catch {}
+
+  // 冻结 document.timeline / Web Animations
+  try {
+    if (document.getAnimations) {
+      const killAnims = () => {
+        try {
+          for (const a of document.getAnimations()) {
+            try { a.cancel(); } catch {}
+          }
+        } catch {}
+      };
+      killAnims();
+      setInterval(killAnims, 2000);
+    }
+  } catch {}
+
+  // 直接废掉 WebGL（签名 WASM 不依赖 WebGL）
+  try {
+    const block = function() { return null; };
+    HTMLCanvasElement.prototype.getContext = new Proxy(HTMLCanvasElement.prototype.getContext, {
+      apply(target, thisArg, args) {
+        const type = String(args[0] || '').toLowerCase();
+        if (type.includes('webgl') || type === 'gpu') return null;
+        // 2d 也禁，避免 canvas 动画
+        if (type === '2d') return null;
+        return Reflect.apply(target, thisArg, args);
+      }
+    });
   } catch {}
 })();
 `;
@@ -569,7 +610,7 @@ export class HdhiveClient {
     this._ensuring = null; // 单飞：正在进行的 _ensureBrowser promise
     this._idleTimer = null;
     this._busyCount = 0;
-    this.idleMs = Number(options.idleMs || process.env.BROWSER_IDLE_MS || 15_000);
+    this.idleMs = Number(options.idleMs || process.env.BROWSER_IDLE_MS || 10_000);
     this.captchaAiBaseUrl = String(options.captchaAiBaseUrl || process.env.CAPTCHA_AI_BASE_URL || '').replace(/\/$/, '');
     this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
     this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
