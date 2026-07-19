@@ -943,7 +943,8 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
         const item = {
           id: r.slug,
           slug: r.slug,
-          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
+          // 用资源描述当 title，上传者昵称放到 uploader，避免已解锁卡片显示昵称
+          title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 100),
           size,
           sizeFormatted: formatSize(size),
           points,
@@ -952,6 +953,7 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
           code,
           isUnlocked,
           cloudType: 'cloud189',
+          uploader: r.uploader || info.uploader || '',
           // 额外字段
           source: info.source || r.source || 'bridge',
           movieId: tmdbId,
@@ -1370,7 +1372,7 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
           enriched.push({
             slug: r.slug,
             url: r.url,
-            title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+            title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
             unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
             website: info.website,
             share_size: info.share_size ?? r.share_size ?? 0,
@@ -1381,7 +1383,7 @@ app.post('/hdhive/preview/tmdb/:tmdbId', async (req, res) => {
           enriched.push({
             slug: r.slug,
             url: r.url,
-            title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+            title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
             unlock_points: null,
             error: e.message.slice(0, 100)
           });

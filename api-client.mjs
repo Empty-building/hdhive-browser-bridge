@@ -2199,7 +2199,7 @@ export class HdhiveClient {
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+          title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
           unlock_points: info.default_unlock_points ?? info.unlock_points ?? null,
           website: info.website,
           share_size: info.share_size ?? r.share_size ?? 0,
@@ -2210,7 +2210,7 @@ export class HdhiveClient {
         enriched.push({
           slug: r.slug,
           url: r.url,
-          title: (r.title || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
+          title: (r.title || r.text?.split('\n').find((line) => /4K|REMUX|WEB|蓝光|字幕|原盘|HDR|DV/i.test(line)) || r.text?.split('\n')[0] || '未命名资源').slice(0, 60),
           unlock_points: null,
           error: e.message.slice(0, 100)
         });
@@ -2409,19 +2409,69 @@ export class HdhiveClient {
 
     const resources = await this._page.evaluate(() => {
       const parseSize = (value) => {
-        const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)/i);
-        if (!match) return 0;
+        // 卡片常出现「324B｜66.69GB」双尺寸，取最大有效体积
+        const matches = String(value || '').matchAll(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)\b/gi);
         const units = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
-        return Math.round(Number(match[1]) * units[match[2].toUpperCase()]);
+        let best = 0;
+        for (const match of matches) {
+          const bytes = Number(match[1]) * (units[match[2].toUpperCase()] || 0);
+          if (Number.isFinite(bytes) && bytes > best) best = bytes;
+        }
+        return Math.round(best);
       };
       const parseTitle = (lines) => {
-        const cleanTitle = (line) => String(line || '').replace(/^免费\s*/, '').trim();
-        const pointsIndex = lines.findIndex((line) => /免费|\d+\s*积分/.test(line));
-        const startIndex = pointsIndex >= 0 ? pointsIndex + 1 : 0;
-        const skipPattern = /^(发布于|免费|\d+\s*积分|疑似失效|加入片单|4K|1080P|720P|简中|简英双语|内封|外挂|WEB-DL\/WEBRip|蓝光原盘\/REMUX|\d+(?:\.\d+)?\s*(TB|GB|MB|KB|B))$/i;
-        const title = lines.slice(startIndex).find((line) => line.length > 3 && !skipPattern.test(line))
-          || lines.find((line) => line.length > 3 && !skipPattern.test(line));
-        return cleanTitle(title) || '影巢天翼资源';
+        const cleanTitle = (line) => String(line || '')
+          .replace(/^免费\s*/, '')
+          .replace(/\s*@\s*和谐点我[!！]?.*$/u, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        // 跳过：发布元信息 / 分辨率标签 / 字幕标签 / 体积行
+        const skipPattern = /^(发布于|免费|已解锁|查看链接|复制链接|\d+\s*积分|疑似失效|加入片单|4K|1080P|720P|2160P|简中|繁中|简英双语|简日双语|内封|外挂|WEB-DL\/WEBRip|蓝光原盘\/REMUX|[\d.]+\s*(TB|GB|MB|KB|B)(?:\s*[|｜].*)?|简中\s*[·•].*|.*\s·\s*内封)$/i;
+        const metaLine = /^(发布于|免费|已解锁|查看链接|复制链接|\d+\s*积分|疑似失效|加入片单)$/i;
+        // 资源描述特征：分辨率/封装/字幕/音轨等（真正的标题行）
+        const descPattern = /4K|1080|720|2160|REMUX|WEB-?DL|WEBRip|蓝光|原盘|字幕|国语|国日|国粤|国台|音轨|HDR|DV|杜比|仅秒传|豆瓣|特效|特字|官译|中字|内封简|外挂/i;
+        // 上传者昵称通常在「发布于」之前；真正标题在发布于/积分/已解锁之后
+        let startIndex = 0;
+        for (let i = 0; i < lines.length; i += 1) {
+          if (/发布于|已解锁|查看链接|复制链接|^\d+\s*积分$|^免费$/i.test(lines[i])) {
+            startIndex = i + 1;
+          }
+        }
+        const pickFrom = (arr) => {
+          // 优先：像资源描述的长行
+          const desc = arr.find((line) => line.length >= 8 && descPattern.test(line) && !skipPattern.test(line));
+          if (desc) return cleanTitle(desc);
+          // 次选：发布信息后的非元信息行
+          const after = arr.find((line) => line.length > 3 && !skipPattern.test(line) && !metaLine.test(line));
+          if (after) return cleanTitle(after);
+          return '';
+        };
+        let title = pickFrom(lines.slice(startIndex));
+        if (!title) {
+          // 兜底：整卡里找描述行，避开「发布于」前的昵称
+          const pubIndex = lines.findIndex((line) => /发布于/.test(line));
+          const candidates = lines.filter((line, idx) => {
+            if (line.length <= 3 || skipPattern.test(line) || metaLine.test(line)) return false;
+            // 发布于之前的短行基本是上传者昵称（如「最爱你的人望眼欲穿」「风的语言」）
+            if (pubIndex >= 0 && idx < pubIndex && line.length <= 16 && !descPattern.test(line)) return false;
+            return true;
+          });
+          title = cleanTitle(candidates.find((line) => descPattern.test(line)) || candidates[0] || '');
+        }
+        return title || '影巢天翼资源';
+      };
+      const parseUploader = (lines) => {
+        const pubIndex = lines.findIndex((line) => /发布于/.test(line));
+        if (pubIndex <= 0) return '';
+        // 发布于前最后一行完整昵称（前面可能有头像单字）
+        for (let i = pubIndex - 1; i >= 0; i -= 1) {
+          const line = lines[i];
+          if (!line || line.length < 2) continue;
+          if (/^(免费|\d+\s*积分|已解锁|4K|1080P|720P)$/i.test(line)) continue;
+          if (line.length === 1) continue; // 头像首字
+          return line.slice(0, 40);
+        }
+        return '';
       };
       const resourceSlugFromAnchor = (anchor) => {
         try {
@@ -2468,6 +2518,7 @@ export class HdhiveClient {
         const unlockPoints = pointsMatch ? Number(pointsMatch[1]) : (isFree || isUnlockedCard ? 0 : null);
         const cloudLink = text.match(/https?:\/\/(?:cloud\.189\.cn|h5\.cloud\.189\.cn|content\.21cn\.com)[^\s"'<>\\)）]+/i);
         const accessCode = (text.match(/(?:访问码|提取码)[：:\s]*([A-Za-z0-9]{4})/) || [])[1] || '';
+        const uploader = parseUploader(lines);
 
         return {
           id: slug,
@@ -2476,6 +2527,7 @@ export class HdhiveClient {
           pageUrl: href.href,
           text: text.slice(0, 1000),
           title: parseTitle(lines),
+          uploader,
           pan_type: '189',
           website: '189',
           share_size: parseSize(text),
