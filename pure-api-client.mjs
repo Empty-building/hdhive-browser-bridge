@@ -596,8 +596,22 @@ export class PureHdhiveClient {
 
   /**
    * 底层 HTTP/HTTPS（原生 socks5/http 代理，无第三方依赖）
+   * 代理抖动 / TLS 半开连接自动重试
    */
-  async _rawRequest(urlString, { method = 'GET', headers = {}, body } = {}) {
+  async _rawRequest(urlString, { method = 'GET', headers = {}, body } = {}, _attempt = 0) {
+    const maxAttempts = 3;
+    try {
+      return await this._rawRequestOnce(urlString, { method, headers, body });
+    } catch (e) {
+      const msg = String(e?.message || e || '');
+      const retriable = /timeout|ECONN|ENOTFOUND|EPIPE|ECONNRESET|socket disconnected|packet length too long|TLS|ssl|secure|proxy|504|502|503/i.test(msg);
+      if (_attempt + 1 >= maxAttempts || !retriable) throw e;
+      await new Promise((r) => setTimeout(r, 200 + _attempt * 350 + Math.floor(Math.random() * 200)));
+      return this._rawRequest(urlString, { method, headers, body }, _attempt + 1);
+    }
+  }
+
+  async _rawRequestOnce(urlString, { method = 'GET', headers = {}, body } = {}) {
     const url = new URL(urlString);
     const isHttps = url.protocol === 'https:';
     const port = Number(url.port || (isHttps ? 443 : 80));
@@ -629,46 +643,48 @@ export class PureHdhiveClient {
     }
     if (payload) hdrs['content-length'] = String(payload.length);
 
-    const rawSocket = await openProxySocket(this.proxyInfo, host, port);
-    rawSocket.setTimeout(this.timeoutMs);
-
-    const socket = isHttps
-      ? tls.connect({
-          socket: rawSocket,
-          servername: host,
-          rejectUnauthorized: true
-        })
-      : rawSocket;
-
-    if (isHttps) {
-      await new Promise((resolve, reject) => {
-        socket.once('secureConnect', resolve);
-        socket.once('error', reject);
-      });
-    }
-
     // 不声明 accept-encoding，避免 gzip 需要额外解压
     delete hdrs['accept-encoding'];
     delete hdrs['Accept-Encoding'];
 
-    const headerText = Object.entries(hdrs)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join('\r\n');
-    const req = `${method.toUpperCase()} ${pathWithQuery} HTTP/1.1\r\n${headerText}\r\n\r\n`;
-    socket.write(req);
-    if (payload) socket.write(payload);
+    const rawSocket = await openProxySocket(this.proxyInfo, host, port);
+    rawSocket.setTimeout(this.timeoutMs);
 
-    // 增量解析：先读响应头，再按 content-length / chunked 读 body
-    // （不能傻等 socket end，keep-alive 会挂死）
-    const { status, resHeaders, bodyBuf } = await readHttpResponse(socket, this.timeoutMs);
-    socket.destroy();
+    let socket = rawSocket;
+    try {
+      if (isHttps) {
+        socket = tls.connect({
+          socket: rawSocket,
+          servername: host,
+          rejectUnauthorized: true,
+          minVersion: 'TLSv1.2'
+        });
+        await new Promise((resolve, reject) => {
+          socket.once('secureConnect', resolve);
+          socket.once('error', reject);
+        });
+      }
 
-    return {
-      status,
-      ok: status >= 200 && status < 300,
-      headers: resHeaders,
-      body: bodyBuf
-    };
+      const headerText = Object.entries(hdrs)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\r\n');
+      const req = `${method.toUpperCase()} ${pathWithQuery} HTTP/1.1\r\n${headerText}\r\n\r\n`;
+      socket.write(req);
+      if (payload) socket.write(payload);
+
+      // 增量解析：先读响应头，再按 content-length / chunked 读 body
+      // （不能傻等 socket end，keep-alive 会挂死）
+      const { status, resHeaders, bodyBuf } = await readHttpResponse(socket, this.timeoutMs);
+      return {
+        status,
+        ok: status >= 200 && status < 300,
+        headers: resHeaders,
+        body: bodyBuf
+      };
+    } finally {
+      try { socket.destroy(); } catch {}
+      try { rawSocket.destroy(); } catch {}
+    }
   }
 
   async handshake({ force = false } = {}) {
