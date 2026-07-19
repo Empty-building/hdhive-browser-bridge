@@ -400,15 +400,12 @@ const DISABLE_ANIMATION_SCRIPT = `
     }
   } catch {}
 
-  // 直接废掉 WebGL（签名 WASM 不依赖 WebGL）
+  // 废掉 WebGL/GPU（签名 WASM 不依赖 WebGL；2d 保留给验证码求解）
   try {
-    const block = function() { return null; };
     HTMLCanvasElement.prototype.getContext = new Proxy(HTMLCanvasElement.prototype.getContext, {
       apply(target, thisArg, args) {
         const type = String(args[0] || '').toLowerCase();
         if (type.includes('webgl') || type === 'gpu') return null;
-        // 2d 也禁，避免 canvas 动画
-        if (type === '2d') return null;
         return Reflect.apply(target, thisArg, args);
       }
     });
