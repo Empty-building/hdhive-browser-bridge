@@ -228,6 +228,8 @@ function buildLaunchOptions({ headless = true, userAgent, proxy } = {}) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
       '--window-size=1366,768',
       '--lang=zh-CN'
     ]
@@ -618,6 +620,10 @@ export class HdhiveClient {
         }
         // 拦截 umami 统计
         if (url.includes('umami.hdhive.com')) return route.abort();
+        // 阻止页面无用 prefetch/rsc 请求（减少 CPU/网络空转）
+        if (url.includes('_rsc=') || url.includes('next-router-prefetch') || url.includes('next-router-segment-prefetch')) {
+          return route.abort();
+        }
         return route.continue();
       });
 
@@ -2011,6 +2017,7 @@ export class HdhiveClient {
       const rtype = route.request().resourceType();
       if (['image', 'font', 'media'].includes(rtype)) return route.abort();
       if (url.includes('umami.hdhive.com')) return route.abort();
+      if (url.includes('_rsc=') || url.includes('next-router-prefetch') || url.includes('next-router-segment-prefetch')) return route.abort();
       return route.continue();
     });
 
