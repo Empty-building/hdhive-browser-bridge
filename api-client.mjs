@@ -233,7 +233,10 @@ function buildLaunchOptions({ headless = true, userAgent, proxy } = {}) {
       '--disable-gpu-compositing',
       '--use-gl=disabled',
       '--disable-software-rasterizer',
-      '--disable-features=Vulkan,UseSkiaRenderer,DefaultANGLE,PaintHolding',
+      '--disable-webgl',
+      '--disable-webgl2',
+      '--max-active-webgl-contexts=0',
+      '--disable-features=Vulkan,UseSkiaRenderer,DefaultANGLE,PaintHolding,WebGL,WebGL2',
       '--window-size=1366,768',
       '--lang=zh-CN'
     ]
