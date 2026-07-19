@@ -16,7 +16,9 @@ probe-*.mjs
 benchmark*.mjs
 stability.mjs
 example.mjs
-dump-*.mjs
+dump-requests.mjs
+dump-rsc.mjs
+dump-sources.mjs
 intercept.mjs
 extract-*.mjs
 find-*.mjs
