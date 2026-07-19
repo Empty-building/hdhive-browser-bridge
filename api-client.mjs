@@ -228,8 +228,11 @@ function buildLaunchOptions({ headless = true, userAgent, proxy } = {}) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
+      '--headless=old',
       '--disable-gpu',
       '--disable-software-rasterizer',
+      '--use-gl=disabled',
+      '--disable-gpu-compositing',
       '--window-size=1366,768',
       '--lang=zh-CN'
     ]
