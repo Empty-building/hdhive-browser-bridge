@@ -2321,6 +2321,7 @@ export class HdhiveClient {
    * 优化：只滚动 2 次（之前 6 次），因为我们只要 slug
    */
   async findResourcesFromMoviePage(movieInternalUrl) {
+    return this._withBusy(async () => {
     await this._ensureBrowser({ initialUrl: movieInternalUrl });
     if (this._pageNeedsMovieReload || this._page.url() !== movieInternalUrl) {
       this._pageNeedsMovieReload = false;
@@ -2443,6 +2444,7 @@ export class HdhiveClient {
       return result;
     });
     return resources;
+    });
   }
 
   /**

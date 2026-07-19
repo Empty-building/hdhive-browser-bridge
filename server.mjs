@@ -897,21 +897,10 @@ app.post('/hdhive/customer/media-resources', async (req, res) => {
 
         const points = info.default_unlock_points ?? info.unlock_points ?? r.unlock_points ?? null;
         const size = info.share_size ?? r.share_size ?? 0;
+        // 搜索阶段只返回列表，不打开详情页抓 189 链接（否则会把单浏览器拖死）
         let link = r.media_url || r.link || '';
         let code = r.access_code || r.code || '';
         let isUnlocked = Boolean(r.is_unlocked || r.isUnlocked || link);
-
-        // 只有免费/已解锁资源才需要打开详情页拿链接；付费锁定资源跳过，避免无效等待。
-        if (!link && (isUnlocked || points === 0)) {
-          try {
-            const cloud189 = await client.getCloud189Links(r.slug);
-            if (cloud189.url) {
-              link = cloud189.url;
-              code = cloud189.accessCode || code || '';
-              isUnlocked = true;
-            }
-          } catch {}
-        }
 
         const item = {
           id: r.slug,
