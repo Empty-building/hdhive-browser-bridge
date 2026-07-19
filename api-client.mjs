@@ -499,10 +499,59 @@ export class HdhiveClient {
     this._hookRegistered = false;
     this._pageNeedsMovieReload = false;
     this._ensuring = null; // 单飞：正在进行的 _ensureBrowser promise
+    this._idleTimer = null;
+    this._busyCount = 0;
+    this.idleMs = Number(options.idleMs || process.env.BROWSER_IDLE_MS || 15_000);
     this.captchaAiBaseUrl = String(options.captchaAiBaseUrl || process.env.CAPTCHA_AI_BASE_URL || '').replace(/\/$/, '');
     this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
     this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
     this.captchaSolver = String(options.captchaSolver || process.env.CAPTCHA_SOLVER || '').toLowerCase();
+  }
+
+  _clearIdleTimer() {
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+  }
+
+  /**
+   * 空闲时跳到 about:blank，停掉影巢首页动画/渲染，避免 gpu-process 空转吃 CPU。
+   * cookie / IndexedDB bindSecret 仍保留在 browser context 里。
+   */
+  async _parkIdlePage() {
+    if (!this._page || this._page.isClosed() || this._busyCount > 0) return;
+    try {
+      const url = this._page.url();
+      if (url.startsWith('about:blank')) return;
+      await this._page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+      this._hookRegistered = false;
+      await this._page.evaluate(() => {
+        window.__hdhiveHookRegistered = false;
+        window.__hdhiveRequire = null;
+      }).catch(() => undefined);
+    } catch {}
+  }
+
+  _scheduleIdlePark() {
+    this._clearIdleTimer();
+    const idleMs = Number(this.idleMs);
+    if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+    this._idleTimer = setTimeout(() => {
+      this._parkIdlePage().catch(() => undefined);
+    }, idleMs);
+    if (typeof this._idleTimer.unref === 'function') this._idleTimer.unref();
+  }
+
+  async _withBusy(fn) {
+    this._busyCount += 1;
+    this._clearIdleTimer();
+    try {
+      return await fn();
+    } finally {
+      this._busyCount = Math.max(0, this._busyCount - 1);
+      if (this._busyCount === 0) this._scheduleIdlePark();
+    }
   }
 
   /**
@@ -654,6 +703,8 @@ export class HdhiveClient {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
       this._ready = true;
+      // warmup 完成后尽快停掉首页渲染，降低空闲 CPU
+      this._scheduleIdlePark();
     })();
 
     try {
@@ -670,13 +721,20 @@ export class HdhiveClient {
       await this._page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
       await this._page.waitForTimeout(2000);
       this._hookRegistered = false;
+      if (this.bindSecret) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+      }
     } catch (e) {}
   }
 
   async _ensureHdhiveRuntime() {
     await this._ensureBrowser({ initialUrl: this.baseUrl });
+    this._clearIdleTimer();
     if (!this._page.url().startsWith(this.baseUrl)) {
       await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      if (this.bindSecret) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+      }
     }
     const ready = await this._page.waitForFunction(
       () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
@@ -684,6 +742,9 @@ export class HdhiveClient {
     ).then(() => true).catch(() => false);
     if (!ready) {
       await this._page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      if (this.bindSecret) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+      }
       await this._page.waitForFunction(
         () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
         { timeout: 10000 }
@@ -719,76 +780,78 @@ export class HdhiveClient {
   }
 
   async call(method, path, { query, body } = {}) {
-    await this._ensureHdhiveRuntime();
-    let fullPath = path;
-    if (query) {
-      const qs = new URLSearchParams();
-      for (const [k, v] of Object.entries(query)) {
-        if (v !== undefined && v !== null) qs.set(k, String(v));
-      }
-      const q = qs.toString();
-      if (q) fullPath += (path.includes('?') ? '&' : '?') + q;
-    }
-
-    const request = {
-      method,
-      fullPath,
-      body: body == null ? null : body,
-      targetPathname: (() => {
-        try {
-          return new URL(fullPath, this.baseUrl).pathname;
-        } catch {
-          return path.split('?')[0];
+    return this._withBusy(async () => {
+      await this._ensureHdhiveRuntime();
+      let fullPath = path;
+      if (query) {
+        const qs = new URLSearchParams();
+        for (const [k, v] of Object.entries(query)) {
+          if (v !== undefined && v !== null) qs.set(k, String(v));
         }
-      })()
-    };
-    const allowUnsignedResponseFallback = String(path).startsWith('/api/customer/');
-    if (this.bindSecret) {
-      await this._seedBindSecret(this.bindSecret).catch(() => false);
-    }
-    let result = await this._runSignedCallWithCapture(request);
+        const q = qs.toString();
+        if (q) fullPath += (path.includes('?') ? '&' : '?') + q;
+      }
 
-    if (result.ok) {
-      return result.response;
-    }
-
-    let message = result.error?.message || String(result.error || 'signed fetch failed');
-    if (allowUnsignedResponseFallback && isMissingResponseSignatureMessage(message)) {
-      const fallback = this._getUnsignedResponseFallback(result);
-      if (fallback) return fallback;
-    }
-
-    // 影巢 bind_token 会话漂移：重新写入 bindSecret 后重试一次
-    if (this.bindSecret && /session_user_mismatch|session_recovery_failed|invalid_session|missing_signature|signature_invalid|请重新登录/i.test(message || '')) {
-      await this._seedBindSecret(this.bindSecret).catch(() => false);
-      await this._page?.evaluate(() => {
-        window.__hdhiveHookRegistered = false;
-        window.__hdhiveRequire = null;
-      }).catch(() => undefined);
-      result = await this._runSignedCallWithCapture(request);
-      if (result.ok) return result.response;
-      message = result.error?.message || String(result.error || 'signed fetch failed');
-    }
-
-    if (/WASM|wasm|SignedFetchError|加载失败/i.test(message || '')) {
-      await this._reloadPage();
+      const request = {
+        method,
+        fullPath,
+        body: body == null ? null : body,
+        targetPathname: (() => {
+          try {
+            return new URL(fullPath, this.baseUrl).pathname;
+          } catch {
+            return path.split('?')[0];
+          }
+        })()
+      };
+      const allowUnsignedResponseFallback = String(path).startsWith('/api/customer/');
       if (this.bindSecret) {
         await this._seedBindSecret(this.bindSecret).catch(() => false);
       }
-      result = await this._runSignedCallWithCapture(request);
-      if (result.ok) return result.response;
+      let result = await this._runSignedCallWithCapture(request);
 
-      message = result.error?.message || String(result.error || 'signed fetch failed');
+      if (result.ok) {
+        return result.response;
+      }
+
+      let message = result.error?.message || String(result.error || 'signed fetch failed');
       if (allowUnsignedResponseFallback && isMissingResponseSignatureMessage(message)) {
         const fallback = this._getUnsignedResponseFallback(result);
         if (fallback) return fallback;
       }
-    }
 
-    const error = new Error(message);
-    error.name = result.error?.name || 'SignedFetchError';
-    error.details = result.error;
-    throw error;
+      // 影巢 bind_token 会话漂移：重新写入 bindSecret 后重试一次
+      if (this.bindSecret && /session_user_mismatch|session_recovery_failed|invalid_session|missing_signature|signature_invalid|请重新登录/i.test(message || '')) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+        await this._page?.evaluate(() => {
+          window.__hdhiveHookRegistered = false;
+          window.__hdhiveRequire = null;
+        }).catch(() => undefined);
+        result = await this._runSignedCallWithCapture(request);
+        if (result.ok) return result.response;
+        message = result.error?.message || String(result.error || 'signed fetch failed');
+      }
+
+      if (/WASM|wasm|SignedFetchError|加载失败/i.test(message || '')) {
+        await this._reloadPage();
+        if (this.bindSecret) {
+          await this._seedBindSecret(this.bindSecret).catch(() => false);
+        }
+        result = await this._runSignedCallWithCapture(request);
+        if (result.ok) return result.response;
+
+        message = result.error?.message || String(result.error || 'signed fetch failed');
+        if (allowUnsignedResponseFallback && isMissingResponseSignatureMessage(message)) {
+          const fallback = this._getUnsignedResponseFallback(result);
+          if (fallback) return fallback;
+        }
+      }
+
+      const error = new Error(message);
+      error.name = result.error?.name || 'SignedFetchError';
+      error.details = result.error;
+      throw error;
+    });
   }
 
   async _runSignedCallWithCapture(request) {
@@ -2379,6 +2442,8 @@ export class HdhiveClient {
   delete(path) { return this.call('DELETE', path); }
 
   async close() {
+    this._clearIdleTimer();
+    this._busyCount = 0;
     if (this._context) {
       await this._context.close().catch(() => {});
       this._context = null;
