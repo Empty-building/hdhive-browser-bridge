@@ -17,8 +17,10 @@ const config = {
   defaultUsername: String(process.env.HDHIVE_USERNAME || ''),
   defaultPassword: String(process.env.HDHIVE_PASSWORD || ''),
   baseUrl: String(process.env.HDHIVE_BASE_URL || 'https://hdhive.com'),
-  userAgent: String(process.env.BROWSER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'),
+  userAgent: String(process.env.BROWSER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'),
   headless: process.env.BROWSER_HEADLESS !== 'false',
+  // Playwright 代理（直连被 Cloudflare 拦时必需），例如 socks5://127.0.0.1:1080
+  browserProxy: String(process.env.HDHIVE_PROXY || process.env.BROWSER_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || ''),
   // 接口超时（单个请求最长执行时间）
   actionTimeoutMs: Number(process.env.ACTION_TIMEOUT_MS || 180_000),
   // 是否启用自动 warmup
@@ -46,6 +48,7 @@ const config = {
 const state = {
   startedAt: Date.now(),
   client: null,
+  bindSecret: String(process.env.HDHIVE_BIND_SECRET || ''),
   lastSuccess: null,
   lastError: null,
   totalCalls: 0,
@@ -80,28 +83,24 @@ function getClient(cookieOverride) {
   if (missingLoginCookies.length > 0) {
     throw new Error(`cookie is incomplete: missing ${missingLoginCookies.join(', ')}; re-login or set a full HDHIVE_COOKIE`);
   }
+  const clientOptions = {
+    baseUrl: config.baseUrl,
+    cookie,
+    headless: config.headless,
+    userAgent: config.userAgent,
+    proxy: config.browserProxy,
+    bindSecret: process.env.HDHIVE_BIND_SECRET || state.bindSecret || '',
+    captchaAiBaseUrl: config.captchaAiBaseUrl,
+    captchaAiApiKey: config.captchaAiApiKey,
+    captchaAiModel: config.captchaAiModel,
+    captchaSolver: config.captchaSolver
+  };
   if (!state.client) {
-    state.client = new HdhiveClient({
-      baseUrl: config.baseUrl,
-      cookie,
-      headless: config.headless,
-      captchaAiBaseUrl: config.captchaAiBaseUrl,
-      captchaAiApiKey: config.captchaAiApiKey,
-      captchaAiModel: config.captchaAiModel,
-      captchaSolver: config.captchaSolver
-    });
+    state.client = new HdhiveClient(clientOptions);
   } else if (state.client.cookie !== cookie) {
     // 如果 cookie 变了，重建 client
     state.client.close().catch(() => {});
-    state.client = new HdhiveClient({
-      baseUrl: config.baseUrl,
-      cookie,
-      headless: config.headless,
-      captchaAiBaseUrl: config.captchaAiBaseUrl,
-      captchaAiApiKey: config.captchaAiApiKey,
-      captchaAiModel: config.captchaAiModel,
-      captchaSolver: config.captchaSolver
-    });
+    state.client = new HdhiveClient(clientOptions);
   }
   return state.client;
 }
@@ -1019,23 +1018,37 @@ async function performHdhiveLogin({
   const profileDir = path.join(os.tmpdir(), `hdhive-login-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   fs.mkdirSync(profileDir, { recursive: true });
 
-  const ctx = await chromium.launchPersistentContext(profileDir, {
+  const launchOptions = {
     headless: config.headless,
     viewport: { width: 1366, height: 768 },
+    screen: { width: 1920, height: 1080 },
     locale: 'zh-CN',
     timezoneId: 'Asia/Shanghai',
     userAgent: config.userAgent,
     ignoreDefaultArgs: ['--enable-automation'],
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1366,768',
+      '--lang=zh-CN'
+    ]
+  };
+  const proxyRaw = String(config.browserProxy || '').trim();
+  if (proxyRaw) {
+    launchOptions.proxy = { server: proxyRaw.replace(/^socks5h:/i, 'socks5:') };
+  }
+
+  const ctx = await chromium.launchPersistentContext(profileDir, launchOptions);
 
   try {
     await ctx.addInitScript(STEALTH_SCRIPT);
     await ctx.addInitScript(RSC_INTERCEPTOR_SCRIPT);
 
     const page = await ctx.pages()[0] || await ctx.newPage();
-    await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+    await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => undefined);
 
     const usernameInput = page.locator('input[name="username"], input[type="email"], input[type="text"]').first();
     const passwordInput = page.locator('input[type="password"]').first();
@@ -1072,8 +1085,50 @@ async function performHdhiveLogin({
     }
 
     const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    // 读取登录后写入的 bindSecret（握手 bind_token），跨浏览器会话必须带着
+    let bindSecret = null;
+    try {
+      bindSecret = await page.evaluate(async () => {
+        const readIdb = () => new Promise((resolve) => {
+          try {
+            const req = indexedDB.open('hdh-secure-bind', 1);
+            req.onerror = () => resolve(null);
+            req.onsuccess = () => {
+              try {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('bind')) return resolve(null);
+                const tx = db.transaction('bind', 'readonly');
+                const getReq = tx.objectStore('bind').get('bindSecret');
+                getReq.onsuccess = () => resolve(typeof getReq.result === 'string' ? getReq.result : null);
+                getReq.onerror = () => resolve(null);
+              } catch {
+                resolve(null);
+              }
+            };
+          } catch {
+            resolve(null);
+          }
+        });
+        const fromIdb = await readIdb();
+        if (fromIdb) return fromIdb;
+        try {
+          return sessionStorage.getItem('hdh:secure-client:bind-secret');
+        } catch {
+          return null;
+        }
+      });
+    } catch {}
+    if (bindSecret) {
+      state.bindSecret = bindSecret;
+      try { fs.writeFileSync('/tmp/hdhive-bind-secret.txt', bindSecret); } catch {}
+    }
+
     if (activate) {
       await activateDefaultCookie(cookieHeader);
+      if (state.client && bindSecret) {
+        try { await state.client.setBindSecret(bindSecret); } catch {}
+      }
     }
 
     let userInfo = null;
@@ -1090,13 +1145,15 @@ async function performHdhiveLogin({
       dbSaved = await saveCookieToDb(saveKey, cookieHeader, {
         hdh_uid: userInfo?.hdh_uid,
         source,
-        ua: String(requestUserAgent || '').slice(0, 200)
+        ua: String(requestUserAgent || '').slice(0, 200),
+        bind_secret: bindSecret || undefined
       });
     }
 
     return {
       cookie: cookieHeader,
       cookieHeader,
+      bindSecret,
       cookieNames: cookies.map(c => c.name),
       cookies: cookies.map(c => ({
         name: c.name,

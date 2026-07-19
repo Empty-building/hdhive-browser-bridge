@@ -10,6 +10,9 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 
 const DEFAULT_BASE = 'https://hdhive.com';
 
+// 影巢 2026-07 改版后 signedFetch 在模块 39154（旧 9110 已失效）
+const SIGNED_FETCH_MODULE_IDS = [39154, 9110];
+
 const REGISTER_AND_RUN = `
 async ({ method, fullPath, body }) => {
   let webpackRequire = window.__hdhiveRequire;
@@ -18,13 +21,27 @@ async ({ method, fullPath, body }) => {
     chunk.push([['__hdhive_probe__'], {}, (req) => { webpackRequire = req; window.__hdhiveRequire = req; }]);
   }
   if (!webpackRequire) throw new Error('webpack require not found');
-  if (!webpackRequire.m['9110']) {
-    try { await webpackRequire.e(9110); } catch (e) {}
+
+  const moduleIds = [39154, 9110];
+  let mod = null;
+  let loadedId = null;
+  for (const id of moduleIds) {
+    if (!webpackRequire.m[String(id)] && !webpackRequire.m[id]) {
+      try { await webpackRequire.e(id); } catch (e) {}
+    }
+    try {
+      const candidate = webpackRequire(id);
+      if (candidate && typeof candidate.t5 === 'function') {
+        mod = candidate;
+        loadedId = id;
+        break;
+      }
+    } catch (e) {}
   }
-  if (!webpackRequire.m['9110']) throw new Error('module 9110 not loaded');
-  const mod9110 = webpackRequire(9110);
-  if (typeof mod9110.P$ === 'function' && !window.__hdhiveHookRegistered) {
-    mod9110.P$({
+  if (!mod) throw new Error('signedFetch module not loaded (tried 39154/9110)');
+
+  if (typeof mod.P$ === 'function' && !window.__hdhiveHookRegistered) {
+    mod.P$({
       getUserId: () => {
         const m = document.cookie.match(/(?:^|;\\s*)hdh_uid=([^;]+)/);
         if (m && /^[1-9]\\d*$/.test(m[1])) return m[1];
@@ -41,7 +58,7 @@ async ({ method, fullPath, body }) => {
     });
     window.__hdhiveHookRegistered = true;
   }
-  if (!mod9110.t5) throw new Error('signedFetch not found');
+  if (!mod.t5) throw new Error('signedFetch not found');
   const init = {
     method: String(method || 'GET').toUpperCase(),
     credentials: 'include',
@@ -51,39 +68,93 @@ async ({ method, fullPath, body }) => {
     init.body = typeof body === 'string' ? body : JSON.stringify(body);
     init.headers['content-type'] = 'application/json';
   }
-  const res = await mod9110.t5(fullPath, init);
+  const res = await mod.t5(fullPath, init);
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = text; }
-  return { status: res.status, ok: res.ok, data };
+  return { status: res.status, ok: res.ok, data, moduleId: loadedId };
 }
 `;
 
 /**
- * 完整 stealth 脚本
+ * 完整 stealth 脚本（对抗影巢 layout 反无头评分，阈值 score>=80 会锁死页面）
  */
 const STEALTH_SCRIPT = `
 (() => {
-  Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });
+  } catch {}
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+  } catch {}
+
   Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'], configurable: true });
-  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5], configurable: true });
   Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
   Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
   Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-  if (navigator.userAgentData) {
-    Object.defineProperty(navigator, 'userAgentData', {
-      get: () => ({
-        brands: [{ brand: 'Google Chrome', version: '125' }, { brand: 'Chromium', version: '125' }, { brand: 'Not.A/Brand', version: '24' }],
-        mobile: false, platform: 'Windows',
-        getHighEntropyValues: async () => ({
-          brands: [{ brand: 'Google Chrome', version: '125' }, { brand: 'Chromium', version: '125' }, { brand: 'Not.A/Brand', version: '24' }],
-          fullVersionList: [{ brand: 'Google Chrome', version: '125.0.0.0' }, { brand: 'Chromium', version: '125.0.0.0' }, { brand: 'Not.A/Brand', version: '24.0.0.0' }],
-          mobile: false, platform: 'Windows', platformVersion: '15.0.0',
-          architecture: 'x86', bitness: '64', model: '', uaFullVersion: '125.0.0.0', wow64: false
-        })
-      }), configurable: true
-    });
-  }
+  Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
+
+  const pluginData = [
+    { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+  ];
+  const plugins = {
+    length: pluginData.length,
+    item: (i) => pluginData[i] || null,
+    namedItem: (n) => pluginData.find((p) => p.name === n) || null,
+    refresh() {},
+    [Symbol.iterator]: function* () { for (const p of pluginData) yield p; }
+  };
+  pluginData.forEach((p, i) => { plugins[i] = p; });
+  Object.defineProperty(navigator, 'plugins', { get: () => plugins, configurable: true });
+
+  const mimeTypes = {
+    length: 2,
+    0: { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+    1: { type: 'text/pdf', suffixes: 'pdf', description: '' },
+    item: (i) => mimeTypes[i] || null,
+    namedItem: () => null,
+    [Symbol.iterator]: function* () { yield mimeTypes[0]; yield mimeTypes[1]; }
+  };
+  Object.defineProperty(navigator, 'mimeTypes', { get: () => mimeTypes, configurable: true });
+  Object.defineProperty(navigator, 'pdfViewerEnabled', { get: () => true, configurable: true });
+
+  window.chrome = window.chrome || { runtime: {}, app: { isInstalled: false }, csi: () => ({}), loadTimes: () => ({}) };
+
+  const brands = [
+    { brand: 'Google Chrome', version: '131' },
+    { brand: 'Chromium', version: '131' },
+    { brand: 'Not_A Brand', version: '24' }
+  ];
+  const userAgentData = {
+    brands,
+    mobile: false,
+    platform: 'Windows',
+    getHighEntropyValues: async () => ({
+      brands,
+      fullVersionList: [
+        { brand: 'Google Chrome', version: '131.0.6778.33' },
+        { brand: 'Chromium', version: '131.0.6778.33' },
+        { brand: 'Not_A Brand', version: '10.0.2.3' }
+      ],
+      mobile: false,
+      platform: 'Windows',
+      platformVersion: '15.0.0',
+      architecture: 'x86',
+      bitness: '64',
+      model: '',
+      uaFullVersion: '131.0.6778.33',
+      wow64: false
+    }),
+    toJSON: () => ({ brands, mobile: false, platform: 'Windows' })
+  };
+  try {
+    Object.defineProperty(navigator, 'userAgentData', { get: () => userAgentData, configurable: true });
+  } catch {}
+
   const patchWebGL = (prototype) => {
     if (!prototype?.getParameter) return;
     const orig = prototype.getParameter;
@@ -97,15 +168,98 @@ const STEALTH_SCRIPT = `
   };
   patchWebGL(window.WebGLRenderingContext?.prototype);
   patchWebGL(window.WebGL2RenderingContext?.prototype);
-  window.chrome = window.chrome || { runtime: {} };
-  for (const key of ['__playwright__binding__', '__pwInitScripts']) {
+
+  for (const key of ['__playwright__binding__', '__pwInitScripts', '__puppeteer_evaluation_script__']) {
     try { delete window[key]; } catch {}
     try {
       Object.defineProperty(window, key, { get: () => undefined, set: () => undefined, configurable: true });
     } catch {}
   }
+
+  try {
+    Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1366, configurable: true });
+    Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 768) + 85, configurable: true });
+  } catch {}
+
+  try {
+    if (navigator.permissions?.query) {
+      const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = (params) => {
+        if (params && (params.name === 'notifications' || params.name === 'push')) {
+          return Promise.resolve({ state: 'prompt', onchange: null });
+        }
+        return originalQuery(params).catch(() => ({ state: 'prompt', onchange: null }));
+      };
+    }
+  } catch {}
+  try {
+    Object.defineProperty(Notification, 'permission', { get: () => 'default', configurable: true });
+  } catch {}
 })();
 `;
+
+function resolveBrowserProxy(explicitProxy) {
+  const raw = String(
+    explicitProxy
+    || process.env.HDHIVE_PROXY
+    || process.env.BROWSER_PROXY
+    || process.env.HTTPS_PROXY
+    || process.env.HTTP_PROXY
+    || process.env.ALL_PROXY
+    || ''
+  ).trim();
+  if (!raw) return undefined;
+  // Playwright 要 socks5://host:port，允许传入 socks5h://
+  const server = raw.replace(/^socks5h:/i, 'socks5:');
+  return { server };
+}
+
+function buildLaunchOptions({ headless = true, userAgent, proxy } = {}) {
+  const options = {
+    headless,
+    viewport: { width: 1366, height: 768 },
+    screen: { width: 1920, height: 1080 },
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
+    userAgent: userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1366,768',
+      '--lang=zh-CN'
+    ]
+  };
+  const resolvedProxy = resolveBrowserProxy(proxy);
+  if (resolvedProxy) options.proxy = resolvedProxy;
+  return options;
+}
+
+function parseCookieHeader(cookieHeader, baseUrl = DEFAULT_BASE) {
+  const host = String(baseUrl || DEFAULT_BASE).replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  return String(cookieHeader || '')
+    .split(';')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const idx = pair.indexOf('=');
+      const name = pair.slice(0, idx).trim();
+      let value = pair.slice(idx + 1).trim();
+      try { value = decodeURIComponent(value); } catch {}
+      return {
+        name,
+        value,
+        domain: host,
+        path: '/',
+        httpOnly: ['hdh_sa_token', 'token', 'refresh_token', 'csrf_access_token'].includes(name),
+        secure: true,
+        sameSite: 'Lax'
+      };
+    })
+    .filter((c) => c.name);
+}
 
 /**
  * 拦截 RSC payload 的 init script（修复版：支持已有 __next_f）
@@ -326,8 +480,11 @@ export class HdhiveClient {
   constructor(options = {}) {
     this.baseUrl = (options.baseUrl || DEFAULT_BASE).replace(/\/$/, '');
     this.cookie = options.cookie || '';
-    this.userAgent = options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+    this.userAgent = options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
     this.headless = options.headless !== false;
+    this.proxy = options.proxy || process.env.HDHIVE_PROXY || process.env.BROWSER_PROXY || '';
+    this.storageStatePath = options.storageStatePath || process.env.HDHIVE_STORAGE_STATE || '';
+    this.bindSecret = options.bindSecret || process.env.HDHIVE_BIND_SECRET || '';
     this._context = null;
     this._page = null;
     this._ready = false;
@@ -338,6 +495,88 @@ export class HdhiveClient {
     this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
     this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
     this.captchaSolver = String(options.captchaSolver || process.env.CAPTCHA_SOLVER || '').toLowerCase();
+  }
+
+  /**
+   * 写入 bindSecret 到浏览器 IndexedDB/sessionStorage。
+   * 影巢 2026-07 起握手必须携带 bind_token，否则 customer API 会 session_user_mismatch。
+   */
+  async setBindSecret(bindSecret) {
+    this.bindSecret = String(bindSecret || '').trim();
+    if (!this.bindSecret) return false;
+    await this._ensureBrowser();
+    return await this._seedBindSecret(this.bindSecret);
+  }
+
+  async _seedBindSecret(bindSecret) {
+    const secret = String(bindSecret || this.bindSecret || '').trim();
+    if (!secret || !this._page) return false;
+    return await this._page.evaluate(async (value) => {
+      const BIND_DB = 'hdh-secure-bind';
+      const BIND_STORE = 'bind';
+      const BIND_KEY = 'bindSecret';
+      const SS_KEY = 'hdh:secure-client:bind-secret';
+      const openDb = () => new Promise((resolve, reject) => {
+        const req = indexedDB.open(BIND_DB, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(BIND_STORE)) db.createObjectStore(BIND_STORE);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error('idb open failed'));
+      });
+      let wroteIdb = false;
+      try {
+        const db = await openDb();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(BIND_STORE, 'readwrite');
+          tx.objectStore(BIND_STORE).put(value, BIND_KEY);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error || new Error('idb write failed'));
+        });
+        db.close();
+        wroteIdb = true;
+      } catch {}
+      try { sessionStorage.setItem(SS_KEY, value); } catch {}
+      // 清掉旧 session，强制下次 t5 用新 bind_token 重新握手
+      try {
+        const openClient = () => new Promise((resolve, reject) => {
+          const req = indexedDB.open('hdh-secure-client', 1);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains('secureClient')) db.createObjectStore('secureClient');
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error || new Error('idb open failed'));
+        });
+        const db = await openClient();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction('secureClient', 'readwrite');
+          tx.objectStore('secureClient').delete('session');
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error || new Error('idb delete failed'));
+        });
+        db.close();
+      } catch {}
+      try { sessionStorage.removeItem('hdh:secure-client:session'); } catch {}
+      // 若模块已加载，优先走官方 GT(bindSecret)
+      try {
+        let req;
+        const chunk = window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+        chunk.push([[`__hdhive_bind_${Date.now()}`], {}, (r) => { req = r; }]);
+        if (req) {
+          let mod = null;
+          for (const id of [39154, 9110]) {
+            try {
+              const candidate = req(id);
+              if (candidate?.GT || candidate?.t5) { mod = candidate; break; }
+            } catch {}
+          }
+          if (mod?.GT) await mod.GT(value);
+        }
+      } catch {}
+      return wroteIdb || true;
+    }, secret);
   }
 
   /**
@@ -359,15 +598,14 @@ export class HdhiveClient {
     this._ensuring = (async () => {
       const profileDir = path.join(os.tmpdir(), `hdhive-api-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       fs.mkdirSync(profileDir, { recursive: true });
-      this._context = await chromium.launchPersistentContext(profileDir, {
+      const launchOptions = buildLaunchOptions({
         headless: this.headless,
-        viewport: { width: 1366, height: 768 },
-        locale: 'zh-CN',
-        timezoneId: 'Asia/Shanghai',
         userAgent: this.userAgent,
-        ignoreDefaultArgs: ['--enable-automation'],
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        proxy: this.proxy
       });
+      // storageState 只能给 browser.newContext，不能给 launchPersistentContext；
+      // 持久化 profile 场景下用 addCookies + 页面内 bind 恢复。
+      this._context = await chromium.launchPersistentContext(profileDir, launchOptions);
       await this._context.addInitScript(STEALTH_SCRIPT);
       await this._context.addInitScript(RSC_INTERCEPTOR_SCRIPT);
 
@@ -384,27 +622,25 @@ export class HdhiveClient {
       });
 
       if (injectCookie && this.cookie) {
-        const cookies = this.cookie.split(';').map(p => p.trim()).filter(Boolean).map(pair => {
-          const idx = pair.indexOf('=');
-          return {
-            name: pair.slice(0, idx).trim(),
-            value: decodeURIComponent(pair.slice(idx + 1).trim()),
-            domain: this.baseUrl.replace(/^https?:\/\//, ''),
-            path: '/',
-            httpOnly: ['hdh_sa_token', 'csrf_access_token'].includes(pair.slice(0, idx).trim()),
-            secure: true
-          };
-        });
+        const cookies = parseCookieHeader(this.cookie, this.baseUrl);
         try { await this._context.addCookies(cookies); } catch (e) {}
       }
 
       this._page = await this._context.pages()[0] || await this._context.newPage();
       const targetUrl = initialUrl || this.baseUrl;
-      await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await this._page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await this._page.waitForFunction(
         () => document.readyState !== 'loading',
         { timeout: 5000 }
       ).catch(() => undefined);
+      // 等 webpack runtime 就绪，并尽量触发安全模块初始化
+      await this._page.waitForFunction(
+        () => Boolean(window.webpackChunk_N_E && typeof window.webpackChunk_N_E.push === 'function'),
+        { timeout: 15000 }
+      ).catch(() => undefined);
+      if (this.bindSecret) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+      }
       this._ready = true;
     })();
 
@@ -495,6 +731,9 @@ export class HdhiveClient {
       })()
     };
     const allowUnsignedResponseFallback = String(path).startsWith('/api/customer/');
+    if (this.bindSecret) {
+      await this._seedBindSecret(this.bindSecret).catch(() => false);
+    }
     let result = await this._runSignedCallWithCapture(request);
 
     if (result.ok) {
@@ -507,8 +746,23 @@ export class HdhiveClient {
       if (fallback) return fallback;
     }
 
+    // 影巢 bind_token 会话漂移：重新写入 bindSecret 后重试一次
+    if (this.bindSecret && /session_user_mismatch|session_recovery_failed|invalid_session|missing_signature|signature_invalid|请重新登录/i.test(message || '')) {
+      await this._seedBindSecret(this.bindSecret).catch(() => false);
+      await this._page?.evaluate(() => {
+        window.__hdhiveHookRegistered = false;
+        window.__hdhiveRequire = null;
+      }).catch(() => undefined);
+      result = await this._runSignedCallWithCapture(request);
+      if (result.ok) return result.response;
+      message = result.error?.message || String(result.error || 'signed fetch failed');
+    }
+
     if (/WASM|wasm|SignedFetchError|加载失败/i.test(message || '')) {
       await this._reloadPage();
+      if (this.bindSecret) {
+        await this._seedBindSecret(this.bindSecret).catch(() => false);
+      }
       result = await this._runSignedCallWithCapture(request);
       if (result.ok) return result.response;
 
@@ -1744,15 +1998,11 @@ export class HdhiveClient {
 
     const profileDir = path.join(os.tmpdir(), `hdhive-resolve-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     fs.mkdirSync(profileDir, { recursive: true });
-    const ctx = await chromium.launchPersistentContext(profileDir, {
+    const ctx = await chromium.launchPersistentContext(profileDir, buildLaunchOptions({
       headless: true,
-      viewport: { width: 1366, height: 768 },
-      locale: 'zh-CN',
-      timezoneId: 'Asia/Shanghai',
       userAgent: this.userAgent,
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
+      proxy: this.proxy
+    }));
     await ctx.addInitScript(STEALTH_SCRIPT);
     const page = await ctx.pages()[0] || await ctx.newPage();
     // 拦截图片/统计加速
