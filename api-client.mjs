@@ -607,7 +607,8 @@ export class HdhiveClient {
     this._ensuring = null; // 单飞：正在进行的 _ensureBrowser promise
     this._idleTimer = null;
     this._busyCount = 0;
-    this.idleMs = Number(options.idleMs || process.env.BROWSER_IDLE_MS || 10_000);
+    // 默认立刻停页；设 BROWSER_IDLE_MS>0 可延迟停页，0 表示请求结束立即 about:blank
+    this.idleMs = Number(options.idleMs ?? process.env.BROWSER_IDLE_MS ?? 0);
     this.captchaAiBaseUrl = String(options.captchaAiBaseUrl || process.env.CAPTCHA_AI_BASE_URL || '').replace(/\/$/, '');
     this.captchaAiApiKey = String(options.captchaAiApiKey || process.env.CAPTCHA_AI_API_KEY || '');
     this.captchaAiModel = String(options.captchaAiModel || process.env.CAPTCHA_AI_MODEL || 'web2api/gemini-auto');
@@ -642,7 +643,11 @@ export class HdhiveClient {
   _scheduleIdlePark() {
     this._clearIdleTimer();
     const idleMs = Number(this.idleMs);
-    if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+    // idleMs <= 0：请求结束立刻 about:blank（最省 CPU）
+    if (!Number.isFinite(idleMs) || idleMs <= 0) {
+      this._parkIdlePage().catch(() => undefined);
+      return;
+    }
     this._idleTimer = setTimeout(() => {
       this._parkIdlePage().catch(() => undefined);
     }, idleMs);
