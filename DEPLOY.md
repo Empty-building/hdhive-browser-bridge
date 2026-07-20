@@ -11,7 +11,7 @@ hdhive-api 把 `server.mjs` 包装成 HTTP REST API。
  * 默认 `HYBRID_MODE=auto`，`AUTO_WARMUP_BROWSER=false`（pure 握手即可 ready）
 
 > 注意：旧 `ghcr.io/wobuhui666/hdhive-bridge:latest` 可能仍是纯浏览器桥。  
-> Hybrid 请用本仓库 `feat/hybrid-pure-api` **本地 build**，或等待推送含 pure 的新镜像。
+> Hybrid 请用本仓库 **本地 `docker compose build`**，或等待推送含 pure 的新镜像。
 ## 🚀 快速开始
 
 ### 方式 0：本机 hybrid（最快验证）
