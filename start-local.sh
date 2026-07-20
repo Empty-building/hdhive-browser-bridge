@@ -20,6 +20,9 @@ export AUTO_WARMUP=true
 export AUTO_LOGIN=false
 export ACTION_TIMEOUT_MS=240000
 export BROWSER_IDLE_MS=0
+# hybrid: auto=pure优先回落浏览器, pure=仅pure, browser=仅浏览器
+export HYBRID_MODE=${HYBRID_MODE:-auto}
+export AUTO_WARMUP_BROWSER=${AUTO_WARMUP_BROWSER:-false}
 export CAPTCHA_AI_BASE_URL=http://127.0.0.1:50002/v1
 export CAPTCHA_AI_API_KEY=sk-Z1aCj7YyVeqVTo4kx
 export CAPTCHA_AI_MODEL=mimo-v2.5

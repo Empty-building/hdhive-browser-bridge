@@ -23,13 +23,20 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
 # 复制源码
+# hybrid: server 依赖 pure-api-client + vendor WASM；浏览器桥仍用 api-client
 COPY api-client.mjs ./
+COPY pure-api-client.mjs ./
 COPY server.mjs ./
 COPY dump-cookies.mjs ./
+COPY vendor ./vendor
 
 # 创建临时目录（用于浏览器 profile 和 cookie 缓存）
 RUN mkdir -p /tmp/hdhive-cache && chmod 777 /tmp/hdhive-cache
 ENV TMPDIR=/tmp/hdhive-cache
+
+# hybrid 默认 pure 优先；需要浏览器回落时再开 AUTO_WARMUP_BROWSER
+ENV HYBRID_MODE=auto
+ENV AUTO_WARMUP_BROWSER=false
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

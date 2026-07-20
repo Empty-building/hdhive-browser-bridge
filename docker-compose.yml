@@ -66,6 +66,11 @@ services:
       # 可选：是否启动时自动预热
       - AUTO_WARMUP=${AUTO_WARMUP:-true}
 
+      # hybrid: auto=pure优先回落浏览器, pure=仅pure, browser=仅浏览器
+      - HYBRID_MODE=${HYBRID_MODE:-auto}
+      # 默认不预热 Chromium（pure 就绪即可对外）
+      - AUTO_WARMUP_BROWSER=${AUTO_WARMUP_BROWSER:-false}
+
       # 可选：签到验证码 AI 配置
       - CAPTCHA_AI_BASE_URL=${CAPTCHA_AI_BASE_URL:-}
       - CAPTCHA_AI_API_KEY=${CAPTCHA_AI_API_KEY:-}
