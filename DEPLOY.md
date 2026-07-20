@@ -1,55 +1,98 @@
 # HDHive API 服务部署指南
 ## 📦 镜像说明
-hdhive-api 是一个 Docker 镜像，把 api-client.mjs 包装成 HTTP REST API 服务，**接口与原 hdhive-browser-bridge 完全兼容**，并新增了 TMDB 一键解锁接口。
-镜像特点：
- * 开箱即用的预编译镜像：ghcr.io/wobuhui666/hdhive-bridge:latest
- * 基于 mcr.microsoft.com/playwright:v1.49.1-noble（已包含 Chromium）
- * 安装中文字体（避免影巢页面乱码）
- * 体积约 1.5GB（包含 Chromium）
-## 🚀 快速开始
-### 方式 1：docker run（最简单）
-```bash
-# 1. 准备 cookie (如果需要本地提权)
-node dump-cookies.mjs "your@email.com" "your-password"
-# 输出到 /tmp/hdhive-cookies.txt
+hdhive-api 把 `server.mjs` 包装成 HTTP REST API。
+**v3 Hybrid**：默认 **pure WASM API 优先**，失败再回落 Playwright；对外 `/hdhive/*` 接口保持兼容。
 
-# 2. 启动容器 (直接使用现成镜像)
+镜像特点：
+
+ * Hybrid：`pure-api-client.mjs` + `vendor/hdh-security.wasm`（无浏览器也可搜/解锁）
+ * 基于 mcr.microsoft.com/playwright:v1.49.1-noble（仍含 Chromium，供登录/验证码/回落）
+ * 安装中文字体（避免影巢页面乱码）
+ * 默认 `HYBRID_MODE=auto`，`AUTO_WARMUP_BROWSER=false`（pure 握手即可 ready）
+
+> 注意：旧 `ghcr.io/wobuhui666/hdhive-bridge:latest` 可能仍是纯浏览器桥。  
+> Hybrid 请用本仓库 `feat/hybrid-pure-api` **本地 build**，或等待推送含 pure 的新镜像。
+## 🚀 快速开始
+
+### 方式 0：本机 hybrid（最快验证）
+```bash
+node dump-cookies.mjs "your@email.com" "your-password"
+# 生成 /tmp/hdhive-cookies.txt 与 /tmp/hdhive-bind-secret.txt
+
+export HDHIVE_PROXY=socks5://127.0.0.1:1081
+bash start-local.sh
+curl -s http://127.0.0.1:10000/health | jq
+```
+
+### 方式 1：docker compose build（推荐 Hybrid）
+```bash
+# 1. 准备 cookie + bindSecret
+node dump-cookies.mjs "your@email.com" "your-password"
+
+# 2. 写 .env
+cat > .env <<EOF
+BRIDGE_TOKEN=your-secret-token
+HDHIVE_COOKIE=$(tr -d '\r\n' </tmp/hdhive-cookies.txt)
+HDHIVE_BIND_SECRET=$(tr -d '\r\n' </tmp/hdhive-bind-secret.txt)
+# 容器访问宿主机代理：不要写 127.0.0.1
+HDHIVE_PROXY=socks5://172.17.0.1:1081
+HYBRID_MODE=auto
+AUTO_WARMUP=true
+AUTO_WARMUP_BROWSER=false
+AUTO_LOGIN=false
+EOF
+
+# 3. 用当前分支构建并启动
+docker compose build hdhive-api
+docker compose up -d
+
+# 4. 健康检查（应 pureReady=true）
+curl -s http://127.0.0.1:10000/health | jq
+docker compose logs -f hdhive-api
+```
+
+### 方式 2：docker run（本地构建 hybrid 镜像）
+```bash
+docker build -t hdhive-api:hybrid .
+docker run -d \
+  --name hdhive-api \
+  -p 10000:10000 \
+  -e BRIDGE_TOKEN=your-secret-token \
+  -e HDHIVE_COOKIE="$(tr -d '\r\n' </tmp/hdhive-cookies.txt)" \
+  -e HDHIVE_BIND_SECRET="$(tr -d '\r\n' </tmp/hdhive-bind-secret.txt)" \
+  -e HDHIVE_PROXY=socks5://172.17.0.1:1081 \
+  -e HYBRID_MODE=auto \
+  -e AUTO_WARMUP_BROWSER=false \
+  -v hdhive-data:/tmp/hdhive-cache \
+  --restart unless-stopped \
+  hdhive-api:hybrid
+```
+
+### 方式 3：旧预编译镜像（仅浏览器桥）
+```bash
 docker run -d \
   --name hdhive-api \
   -p 10000:10000 \
   -e BRIDGE_TOKEN=your-secret-token \
   -e HDHIVE_COOKIE="$(cat /tmp/hdhive-cookies.txt)" \
+  -e HYBRID_MODE=browser \
   -v hdhive-data:/tmp/hdhive-cache \
   --restart unless-stopped \
   ghcr.io/wobuhui666/hdhive-bridge:latest
-
 ```
-### 方式 2：docker-compose（推荐）
-```bash
-# 1. 准备 cookie
-node dump-cookies.mjs "your@email.com" "your-password"
 
-# 2. 写 .env 文件
-cat > .env <<EOF
-BRIDGE_TOKEN=your-secret-token
-HDHIVE_COOKIE=$(cat /tmp/hdhive-cookies.txt)
-EOF
-
-# 3. 启动
-docker-compose up -d
-
-# 4. 查看日志
-docker-compose logs -f hdhive-api
-
-```
-### 方式 3：Render.com 部署
+### 方式 4：Render.com 部署
  1. 在 Render 创建 Web Service
- 2. 选择 Deploy an existing image from a registry
- 3. 填入镜像地址：ghcr.io/wobuhui666/hdhive-bridge:latest
+ 2. 选择 Deploy an existing image from a registry（或连 git 自建）
+ 3. 镜像地址：含 hybrid 的自建镜像 / 或旧 `ghcr.io/wobuhui666/hdhive-bridge:latest`
  4. 设置环境变量：
    * BRIDGE_TOKEN
    * HDHIVE_COOKIE
+   * HDHIVE_BIND_SECRET
+   * HDHIVE_PROXY（如需代理）
+   * HYBRID_MODE=auto
  5. Deploy
+
 ## 🔑 环境变量
 | 变量 | 必需 | 默认值 | 说明 |
 |---|---|---|---|
@@ -61,7 +104,11 @@ docker-compose logs -f hdhive-api
 | HDHIVE_BASE_URL | ❌ | https://hdhive.com | 影巢基础 URL |
 | BROWSER_HEADLESS | ❌ | true | 是否无头模式（调试可设 false） |
 | ACTION_TIMEOUT_MS | ❌ | 180000 | 单个接口超时（毫秒） |
-| AUTO_WARMUP | ❌ | true | 启动时自动预热浏览器 |
+| AUTO_WARMUP | ❌ | true | 启动预热总开关（hybrid 下默认先 pure 握手） |
+| AUTO_WARMUP_BROWSER | ❌ | false | 是否预热 Chromium；pure 优先时建议 false |
+| HYBRID_MODE | ❌ | auto | `auto` pure优先回落浏览器；`pure` 仅pure；`browser` 仅浏览器 |
+| HDHIVE_BIND_SECRET | ❌ | 空 | 握手 bind_token（2026-07 后 customer API 必需） |
+| HDHIVE_PROXY / BROWSER_PROXY | ❌ | 空 | 出站代理，如 `socks5://172.17.0.1:1081`（容器勿写 127.0.0.1） |
 | CAPTCHA_AI_BASE_URL | ❌ | 空 | 自动签到验证码 AI endpoint，例如 https://example.com/v1 |
 | CAPTCHA_AI_API_KEY | ❌ | 空 | 自动签到验证码 AI key。只用于验证码图片识别，不会发送 Cookie |
 | CAPTCHA_AI_MODEL | ❌ | web2api/gemini-auto | 自动签到验证码模型 |
@@ -70,6 +117,27 @@ docker-compose logs -f hdhive-api
 | DATABASE_URL | ❌ | 空 | Postgres 连接串。**设置后启用 cookie 持久化** |
 | BRIDGE_STATE_SECRET | ❌ | BRIDGE_TOKEN | 加密密钥（用于数据库存储 cookie） |
 | COOKIE_KEY | ❌ | default | 数据库中 cookie 的 key（多实例时区分） |
+### Hybrid 分流（部署时要知道）
+| 场景 | 引擎 |
+|---|---|
+| 搜索 `media-resources` / preview | pure HTML 解析，失败→浏览器 |
+| 解锁 / 取码 | pure unlock API，失败→浏览器 |
+| 用户/积分/通用 customer | pure，失败→浏览器 |
+| 登录 / 验证码签到 / unlock/share | 浏览器 |
+
+`/health` 示例：
+```json
+{
+  "ready": true,
+  "hybrid": {
+    "mode": "auto",
+    "pureReady": true,
+    "browserReady": false,
+    "lastEngine": "pure"
+  }
+}
+```
+
 ### Cookie 传递优先级
 每个请求的 cookie 按以下优先级获取：
  1. **请求 body**：POST /hdhive/login body 中传 {"cookie": "..."}
@@ -183,10 +251,10 @@ docker exec -i hdhive-postgres-new psql < cookies.sql
 所有接口（除 /health）需要 x-bridge-token 请求头。
 ### 基础接口
 #### GET /health
-健康检查（不需要 token）。
+健康检查（不需要 token）。Hybrid 下 **pure 握手成功即可 ready**，不必等 Chromium。
 ```bash
 curl http://localhost:10000/health
-# {"success":true,"status":"healthy","uptime":12345,...}
+# {"success":true,"ready":true,"status":"healthy","hybrid":{"mode":"auto","pureReady":true,...}}
 
 ```
 #### GET /metrics
@@ -418,13 +486,14 @@ for (const tmdbId of [372058, 550, 129]) {
  * POST /hdhive/unlock/resource/:slug
  * POST /hdhive/unlock/share
 ## 🐳 Docker 部署示例
-### docker-compose.yml 完整示例
+### docker-compose.yml 完整示例（Hybrid）
 ```yaml
 version: '3.8'
 
 services:
   hdhive-api:
-    image: ghcr.io/wobuhui666/hdhive-bridge:latest
+    build: .
+    image: hdhive-api:hybrid
     container_name: hdhive-api
     restart: unless-stopped
     ports:
@@ -432,9 +501,14 @@ services:
     environment:
       - BRIDGE_TOKEN=your-strong-token-here
       - HDHIVE_COOKIE=${HDHIVE_COOKIE}
+      - HDHIVE_BIND_SECRET=${HDHIVE_BIND_SECRET}
+      - HDHIVE_PROXY=${HDHIVE_PROXY:-socks5://172.17.0.1:1081}
+      - BROWSER_PROXY=${HDHIVE_PROXY:-socks5://172.17.0.1:1081}
       - HDHIVE_BASE_URL=https://hdhive.com
       - BROWSER_HEADLESS=true
+      - HYBRID_MODE=auto
       - AUTO_WARMUP=true
+      - AUTO_WARMUP_BROWSER=false
     volumes:
       - hdhive-data:/tmp/hdhive-cache
     healthcheck:
@@ -446,15 +520,15 @@ services:
 
 volumes:
   hdhive-data:
-
 ```
+
 ### 生产部署建议
  1. **使用反向代理**（nginx / caddy）：
    ```nginx
    location /hdhive/ {
      proxy_pass http://127.0.0.1:10000;
      proxy_set_header X-Forwarded-For $remote_addr;
-     proxy_read_timeout 300s;  # 关键：解锁可能耗时 30-60s
+     proxy_read_timeout 120s;  # pure 通常 3-10s；浏览器回落可到 60s+
    }
    
    ```
@@ -464,7 +538,7 @@ volumes:
    deploy:
      resources:
        limits:
-         memory: 4G  # Chromium 浏览器较耗内存
+         memory: 1G  # pure 为主通常够用；常回落浏览器建议 2-4G
    
    ```
  4. **日志收集**：配置 logging.driver 收集日志到 ELK/Loki
@@ -564,3 +638,40 @@ docker pull ghcr.io/wobuhui666/hdhive-bridge:latest
 docker-compose up -d
 
 ```
+
+
+## 🧩 Hybrid / pure-api 故障
+
+### Docker 报找不到 pure-api-client / WASM
+镜像过旧。Dockerfile 需包含：
+
+```dockerfile
+COPY pure-api-client.mjs ./
+COPY vendor ./vendor
+```
+
+然后：
+
+```bash
+docker compose build --no-cache hdhive-api
+```
+
+### 容器里全部超时 / Cloudflare
+`HDHIVE_PROXY=socks5://127.0.0.1:1081` 在容器内指向容器自己。应改为宿主机代理：
+
+```bash
+HDHIVE_PROXY=socks5://172.17.0.1:1081
+```
+
+### `session_user_mismatch`
+缺 `HDHIVE_BIND_SECRET`。重新 `dump-cookies.mjs` 或登录后写入 bindSecret。
+
+### 只想强制浏览器 / 只想 pure
+```bash
+HYBRID_MODE=browser
+# 或
+HYBRID_MODE=pure
+```
+
+### 验证码签到
+`POST /hdhive/customer/checkin` 带 `autoVerify=true` 时强制浏览器，并需要 `CAPTCHA_AI_*` 或 heuristic。
