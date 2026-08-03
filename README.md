@@ -1,5 +1,6 @@
 # 影巢 API 桥接（hdhive-browser-bridge）
-请勿使用 会出现 “操作行为异常，已暂时限制”
+# 请勿使用！！！！！ 会出现 “操作行为异常，已暂时限制”
+
 Hybrid 桥接服务：优先用 **纯 Node WASM API** 完成搜索/解锁，必要时回落 **Playwright 浏览器**。  
 对外仍提供 cloud189-auto-save 兼容的 `/hdhive/*` 接口。
 
