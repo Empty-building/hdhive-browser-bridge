@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
-import { webcrypto as nodeCrypto, randomBytes } from 'node:crypto';
+import { createHash, webcrypto as nodeCrypto, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +58,16 @@ function ensureCrypto() {
     });
   }
   return globalThis.crypto;
+}
+
+export function solveHandshakePow(clientPub, timestamp) {
+  const prefix = `${clientPub}:${timestamp}:`;
+  for (let candidate = 0; candidate < 0x7fffffff; candidate += 1) {
+    const nonce = candidate.toString(36);
+    const digest = createHash('sha256').update(prefix + nonce).digest();
+    if (digest[0] === 0 && digest[1] === 0) return nonce;
+  }
+  throw new Error('unable to solve handshake proof of work');
 }
 
 function parseProxy(proxyUrl) {
@@ -706,11 +716,13 @@ export class PureHdhiveClient {
     }
     const uaFingerprint = await this._uaFingerprint();
     const ts = Date.now() + this.clockSkewMs;
+    const clientPubB64 = Buffer.from(clientPub).toString('base64');
     const payload = {
-      client_pub: Buffer.from(clientPub).toString('base64'),
+      client_pub: clientPubB64,
       ua_fingerprint: uaFingerprint,
       ts,
-      bind_token: this.bindSecret || ''
+      bind_token: this.bindSecret || '',
+      pow_nonce: solveHandshakePow(clientPubB64, ts)
     };
     const res = await this._rawRequest(`${this.baseUrl}/api/public/security/session/handshake`, {
       method: 'POST',
