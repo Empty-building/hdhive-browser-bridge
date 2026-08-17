@@ -10,9 +10,6 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 
 const DEFAULT_BASE = 'https://hdhive.com';
 
-// 影巢 2026-07 改版后 signedFetch 在模块 39154（旧 9110 已失效）
-const SIGNED_FETCH_MODULE_IDS = [39154, 9110];
-
 const REGISTER_AND_RUN = `
 async ({ method, fullPath, body }) => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -37,8 +34,15 @@ async ({ method, fullPath, body }) => {
   }
   if (!webpackRequire) throw new Error('webpack require not found');
 
-  const moduleIds = [39154, 9110];
+  const discoveredIds = Object.entries(webpackRequire.m || {})
+    .filter(([, factory]) => {
+      const source = String(factory);
+      return source.includes('signedFetch') || source.includes('/api/public/security/session/handshake');
+    })
+    .map(([id]) => Number(id));
+  const moduleIds = [...new Set([4237, 39154, 9110, ...discoveredIds])];
   let mod = null;
+  let signedFetch = null;
   let loadedId = null;
   for (const id of moduleIds) {
     if (!webpackRequire.m[String(id)] && !webpackRequire.m[id]) {
@@ -46,14 +50,16 @@ async ({ method, fullPath, body }) => {
     }
     try {
       const candidate = webpackRequire(id);
-      if (candidate && typeof candidate.t5 === 'function') {
+      const candidateFetch = candidate?.signedFetch || candidate?.t5;
+      if (typeof candidateFetch === 'function') {
         mod = candidate;
+        signedFetch = candidateFetch;
         loadedId = id;
         break;
       }
     } catch (e) {}
   }
-  if (!mod) throw new Error('signedFetch module not loaded (tried 39154/9110)');
+  if (!mod) throw new Error('signedFetch module not loaded');
 
   if (typeof mod.P$ === 'function' && !window.__hdhiveHookRegistered) {
     mod.P$({
@@ -73,7 +79,7 @@ async ({ method, fullPath, body }) => {
     });
     window.__hdhiveHookRegistered = true;
   }
-  if (!mod.t5) throw new Error('signedFetch not found');
+  if (!signedFetch) throw new Error('signedFetch not found');
   const init = {
     method: String(method || 'GET').toUpperCase(),
     credentials: 'include',
@@ -83,7 +89,7 @@ async ({ method, fullPath, body }) => {
     init.body = typeof body === 'string' ? body : JSON.stringify(body);
     init.headers['content-type'] = 'application/json';
   }
-  const res = await mod.t5(fullPath, init);
+  const res = await signedFetch(fullPath, init);
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = text; }
@@ -748,10 +754,16 @@ export class HdhiveClient {
         chunk.push([[`__hdhive_bind_${Date.now()}`], {}, (r) => { req = r; }]);
         if (req) {
           let mod = null;
-          for (const id of [39154, 9110]) {
+          const discoveredIds = Object.entries(req.m || {})
+            .filter(([, factory]) => {
+              const source = String(factory);
+              return source.includes('signedFetch') || source.includes('/api/public/security/session/handshake');
+            })
+            .map(([id]) => Number(id));
+          for (const id of [...new Set([4237, 39154, 9110, ...discoveredIds])]) {
             try {
               const candidate = req(id);
-              if (candidate?.GT || candidate?.t5) { mod = candidate; break; }
+              if (candidate?.GT || candidate?.signedFetch || candidate?.t5) { mod = candidate; break; }
             } catch {}
           }
           if (mod?.GT) await mod.GT(value);
